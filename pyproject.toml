@@ -1,0 +1,108 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "spider"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "numpy",
+  "torch",
+  "loguru",
+  "tyro",
+  "loop-rate-limiters",
+  "hydra-core",
+  "matplotlib",
+  "imageio[ffmpeg]",
+  "mediapy",
+  "opencv-python",
+  "mujoco==3.5.1.dev880735671",
+  "mujoco-warp @ git+https://github.com/google-deepmind/mujoco_warp@dde89450a160ad0ccd12c6b95ff4ca88ccc723ee",
+  "warp-lang==1.11.0.dev20251120",
+  "rerun-sdk==0.26.2",
+  "viser",
+  "ipdb",
+  "pymeshlab",
+  "open3d",
+  "ipykernel",
+  "huggingface_hub",
+  "gspread",
+  "google-auth",
+  "mink",
+]
+
+[project.scripts]
+spider-mjwp = "examples.run_mjwp:main"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[[tool.uv.index]]
+name = "mujoco-nightly"
+url = "https://py.mujoco.org/"
+explicit = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com/"
+explicit = true
+
+[tool.uv.sources]
+mujoco = { index = "mujoco-nightly" }
+warp-lang = { index = "nvidia" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["spider"]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.13.2",
+]
+
+[tool.ruff]
+# Same as Black.
+line-length = 88
+indent-width = 4
+
+# Assume Python 3.12+
+target-version = "py312"
+
+[tool.ruff.lint]
+# Enable pycodestyle (`E`) and Pyflakes (`F`) codes by default.
+# Plus Google style conventions
+select = [
+  "E",    # pycodestyle errors
+  "W",    # pycodestyle warnings
+  "F",    # Pyflakes
+  "I",    # isort
+  "N",    # pep8-naming
+  "D",    # pydocstyle (Google style docstrings)
+  "UP",   # pyupgrade
+  "B",    # flake8-bugbear
+  "C4",   # flake8-comprehensions
+  "SIM",  # flake8-simplify
+]
+
+ignore = [
+  "E501",   # Line too long (handled by formatter)
+  "D100",   # Missing docstring in public module
+  "D104",   # Missing docstring in public package
+  "D107",   # Missing docstring in `__init__`
+]
+
+[tool.ruff.format]
+# Use Google style formatting
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.ruff.lint.pydocstyle]
+# Use Google-style docstrings
+convention = "google"
+
+[tool.ruff.lint.isort]
+known-first-party = ["spider"]

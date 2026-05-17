@@ -1,0 +1,57 @@
+# @package _global_
+# MJWP settings for the ASM ourdata/milk scene without contact guidance.
+dataset_dir: example_datasets
+dataset_name: ourdata
+robot_type: asm
+embodiment_type: bimanual
+task: milk
+data_id: 0
+
+viewer: none
+show_viewer: false
+rerun_spawn: false
+save_video: true
+save_info: true
+save_metrics: true
+save_config: true
+wait_on_finish: false
+
+contact_guidance: false
+contact_rew_scale: 0.0
+use_torch_compile: false
+
+num_samples: 128
+max_num_iterations: 8
+temperature: 0.3
+horizon: 1.0
+sim_dt: 0.005
+ctrl_dt: 0.05
+knot_dt: 0.05
+max_sim_steps: -1
+nconmax_per_env: 1024
+njmax_per_env: 2048
+improvement_threshold: 0.0
+
+first_ctrl_noise_scale: 0.2
+last_ctrl_noise_scale: 0.35
+final_noise_scale: 0.02
+joint_noise_scale: 0.05 # 当前没有物体 actuator
+pos_noise_scale: 0.005
+rot_noise_scale: 0.005
+
+# Tracking weights.
+# Keep arm tracking dominant, but give the real milk object enough weight to
+# affect sampling. Fingertip tracking is a moderate helper, not a hard target.
+base_pos_rew_scale: 0.0
+base_rot_rew_scale: 0.0
+pos_rew_scale: 1.0
+rot_rew_scale: 0.25
+joint_rew_scale: 1.0
+arm_joint_rew_scale: 2.0
+hand_joint_rew_scale: 1.0
+fingertip_rew_scale: 0.25
+vel_rew_scale: 0.02
+terminal_rew_scale: 0.8
+
+object_pos_threshold: 0.25
+object_rot_threshold: 0.8

@@ -1,0 +1,133 @@
+# @package _global_
+defaults:
+  - _self_
+
+# === TASK CONFIGURATION ===
+robot_type: xhand # "inspire", "allegro", "g1"
+embodiment_type: bimanual # "left", "right", "bimanual", "CMU"
+task: pick_spoon_bowl
+seed: 0
+
+# === DATASET CONFIGURATION ===
+dataset_dir: example_datasets
+dataset_name: oakink
+data_id: 0
+# model_path 是 场景描述文件，MuJoCo 的 MJCF 格式场景文件，里面描述的是一切不随时间变的东西
+  # 机器人的几何（机械手的每根指节、关节、mesh）
+  # 物体的几何（比如"勺子"的凸分解网格）
+  # 桌面、光照、相机
+  # Actuator（电机）的定义、关节的 PD 增益
+  # 所有带名字的 site（跟踪点、接触点、IK 目标点）
+model_path: ""  # 自动拼 dataset_dir/dataset_name/robot_type/embodiment_type/task/scene.xml
+# data_path 是 轨迹数据文件，NumPy npz 格式，里面描述的是随时间变的东西
+  # qpos [T, nq] —— 每一帧所有关节的位置（包括机器人每个指关节的角度，加上物体的 xyz+四元数）
+  # qvel [T, nv] —— 每一帧的关节速度
+  # ctrl [T, nu] —— 每一帧的控制指令（给电机的目标角度/力矩）
+  # contact / contact_pos —— 每一帧手指跟物体哪些接触点接触、在哪儿
+data_path: ""   # 自动拼 dataset_dir/dataset_name/robot_type/embodiment_type/task/{data_id}/trajectory_kinematic.npz
+
+# === SIMULATOR CONFIGURATION ===
+simulator: mjwp # "isaac" | "mujoco" | "mjwp" | "mjwp_cons" | "mjwp_eq" | "mjwp_cons_eq" | "kinematic"
+device: cuda:0
+# Simulation timing
+sim_dt: 0.01 # simulation timestep
+ctrl_dt: 0.4 # control timestep
+ref_dt: 0.02 # reference data timestep (1/50.0)
+render_dt: 0.02 # rendering timestep
+horizon: 1.6 # planning horizon
+knot_dt: 0.4 # knot point spacing
+max_sim_steps: -1 # maximum simulation steps (-1 for unlimited)
+# Simulation constraints
+nconmax_per_env: 120 # max contacts per environment
+njmax_per_env: 350 # max joints per environment
+# Simulation annealing
+num_dyn: 1 # number of environments for annealing, used for virtual contact constraint
+# Domain randomization
+num_dr: 1 # number of domain randomization groups, used for domain randomization
+pair_margin_range: [-0.005, 0.005]
+xy_offset_range: [-0.005, 0.005]
+perturb_force: 0.0
+perturb_torque: 0.0
+contact_guidance: false
+
+# === OPTIMIZER CONFIGURATION ===
+# Sampling parameters
+num_samples: 1024
+temperature: 0.1
+max_num_iterations: 32
+improvement_threshold: 0.01
+improvement_check_steps: 1
+# Compilation
+use_torch_compile: true
+# Noise scheduling
+first_ctrl_noise_scale: 0.5
+last_ctrl_noise_scale: 1.0
+final_noise_scale: 0.1
+exploit_ratio: 0.01
+exploit_noise_scale: 0.01
+# Noise scaling by component
+joint_noise_scale: 0.15
+pos_noise_scale: 0.03
+rot_noise_scale: 0.03
+# Reward scaling
+base_pos_rew_scale: 1.0
+base_rot_rew_scale: 0.3
+joint_rew_scale: 0.003
+arm_joint_rew_scale: -1.0
+hand_joint_rew_scale: -1.0
+pos_rew_scale: 1.0
+rot_rew_scale: 0.3
+vel_rew_scale: 0.0001
+terminal_rew_scale: 1.0
+contact_rew_scale: 0.0
+fingertip_rew_scale: 0.0
+# Termination threshold
+terminate_resample: false
+object_pos_threshold: 0.1 # meters
+object_rot_threshold: 0.3 # radians
+# Gibbs sampling
+gibbs_sampling: false
+
+# === VISUALIZATION CONFIGURATION ===
+show_viewer: true
+viewer: mujoco-rerun # "mujoco" | "rerun" | "viser" | "isaac"
+viser_host: 0.0.0.0
+viser_port: 8080
+rerun_spawn: true
+save_video: true
+save_rerun: false
+save_metrics: true
+save_info: true
+save_config: true
+
+# === TRACE RECORDING ===
+trace_dt: 0.02 # 1/50.0
+num_trace_uniform_samples: 4
+num_trace_topk_samples: 2
+trace_site_ids: []
+
+# === AUTOMATICALLY SET PROPERTIES ===
+# Computed timesteps
+horizon_steps: -1
+knot_steps: -1
+ref_steps: -1
+ctrl_steps: -1
+# Model dimensions
+nq_obj: -1 # object DOF
+nq: -1 # total position DOF
+nv: -1 # total velocity DOF
+nu: -1 # total control DOF
+npair: -1 # total pair DOF
+# Computed tensors (these will be set programmatically)
+noise_scale: null
+beta_traj: -1.0
+# Runtime state
+env_params_list: []
+viewer_body_entity_and_ids: []
+output_dir: ""
+
+# Hydra configuration
+hydra:
+  run:
+    dir: .
+  output_subdir: null

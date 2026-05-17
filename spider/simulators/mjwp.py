@@ -1,0 +1,1456 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Simulator for sampling with MuJoCo Warp (mjwarp).
+
+This module provides a minimal MJWP backend that matches the sampling API used by
+the generic optimizer pipeline. It intentionally keeps the implementation simple
+and robust (no DR groups here; see legacy script for advanced features).
+"""
+# 这个文件是一个仿真后端，一个并行环境系统，一个给优化器提供 step/reward/terminate 的模块，可以同时跑很多个 word
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import loguru
+import mujoco
+import mujoco_warp as mjwarp
+import numpy as np
+import torch
+import warp as wp
+
+# NOTE: this is a hacky solution to make sure domain randomization works for contact margin. Otherwise, it will create a surrogate memory for all worlds and we cannot override each individual world's contact parameters.
+# mjwarp._src.io.MAX_WORLDS = 1024
+from spider.config import Config
+from spider.math import quat_sub
+
+# Initialize Warp once per process
+try:
+    wp.init()
+except RuntimeError:
+    # Already initialized
+    pass
+
+
+@dataclass
+class MJWPEnv:
+    model_cpu: mujoco.MjModel
+    data_cpu: mujoco.MjData
+    # Unified data sink always reflecting last step's state
+    model_wp: mjwarp.Model
+    data_wp: mjwarp.Data
+    data_wp_prev: mjwarp.Data
+    graph: wp.ScopedCapture.Graph | None
+    # Device alias used for Warp allocations/launches (e.g., "cuda:1" or "cpu")
+    device: str
+    num_worlds: int
+    ctrl_low: torch.Tensor
+    ctrl_high: torch.Tensor
+    ctrl_limited: torch.Tensor
+
+
+def _compile_step(
+    model_wp: mjwarp.Model, data_wp: mjwarp.Data, device: str
+) -> wp.ScopedCapture.Graph | None:
+    """Warm up and capture a CUDA graph that runs a single mjwarp.step."""
+
+    if not str(device).startswith("cuda"):
+        loguru.logger.warning(
+            "MJWP CUDA graph capture is unavailable on device={}; using direct mjwarp.step().",
+            device,
+        )
+        return None
+
+    def _step_once():
+        mjwarp.step(model_wp, data_wp)
+
+    # Warmup/compile
+    # _step_once()
+    # _step_once()
+    # wp.synchronize()
+    # Capture
+    with wp.ScopedCapture() as capture:
+        _step_once()
+    wp.synchronize()
+    return capture.graph
+
+
+# TODO: define update environment parameter kernel functions, combine them compile step, also add parameter to be modified into MJWPEnv
+
+# --
+# Key functions
+# --
+
+
+def setup_mj_model(config: Config) -> mujoco.MjModel:
+    model_cpu = mujoco.MjModel.from_xml_path(config.model_path)
+    model_cpu.opt.timestep = float(config.sim_dt)
+    if config.embodiment_type in ["left", "right", "bimanual"]:
+        # setup for hand
+        model_cpu.opt.iterations = 32
+        model_cpu.opt.ls_iterations = 80
+        if hasattr(model_cpu.opt, "ccd_iterations"):
+            model_cpu.opt.ccd_iterations = max(int(model_cpu.opt.ccd_iterations), 64)
+        model_cpu.opt.o_solref = [0.02, 1.0]
+        model_cpu.opt.o_solimp = [
+            0.0,
+            0.95,
+            0.03,
+            0.5,
+            2,
+        ]  # softer contact for sim2real
+        model_cpu.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+    elif config.embodiment_type in ["humanoid", "humanoid_object"]:
+        # setup for humanoid
+        model_cpu.opt.iterations = 5
+        model_cpu.opt.ls_iterations = 10
+        model_cpu.opt.o_solref = [0.02, 1.0]
+        model_cpu.opt.o_solimp = [
+            0.9,
+            0.95,
+            0.001,
+            0.5,
+            2,
+        ]  # softer contact for sim2real
+        model_cpu.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+    return model_cpu
+
+# 用 qpos_ref[0], qvel_ref[0], ctrl_ref[0] 来初始化 MuJoCo，再转到 MJWarp，按照 numsamples 建并行世界
+def setup_env(config: Config, ref_data: tuple[torch.Tensor, ...]) -> MJWPEnv:
+    """Setup and reset the environment backed by MJWP.
+    Returns an MJWPEnv with captured graph.
+    """
+    qpos_ref, qvel_ref, ctrl_ref = ref_data[:3]
+    qpos_init = qpos_ref[0]
+
+    # CPU model/data
+    model_cpu = setup_mj_model(config)
+    data_cpu = mujoco.MjData(model_cpu)
+    # Seed initial state
+    arrs = (qpos_init, qvel_ref[0], ctrl_ref[0])
+    data_cpu.qpos[:] = arrs[0].detach().cpu().numpy()
+    data_cpu.qvel[:] = arrs[1].detach().cpu().numpy()
+    ctrl_init = arrs[2].detach().cpu().numpy().copy()
+    ctrl_limited_np = model_cpu.actuator_ctrllimited.astype(bool)
+    if np.any(ctrl_limited_np):
+        ctrl_init[ctrl_limited_np] = np.clip(
+            ctrl_init[ctrl_limited_np],
+            model_cpu.actuator_ctrlrange[ctrl_limited_np, 0],
+            model_cpu.actuator_ctrlrange[ctrl_limited_np, 1],
+        )
+    data_cpu.ctrl[:] = ctrl_init
+    data_cpu.time = 0.0
+    # Keep the MJWP initial state exactly on the first IK frame. mj_forward
+    # updates kinematics/contact buffers without advancing qpos/qvel.
+    mujoco.mj_forward(model_cpu, data_cpu)
+
+    # Move to Warp (batched worlds)
+    # Set Warp default device to match config to ensure kernels/modules load on it
+    wp.set_device(str(config.device))
+    # Build default model/data/graph on the configured device
+    dev = str(config.device)
+    with wp.ScopedDevice(dev):
+        # 先把第 0 帧摆好，然后复制 32 个并行世界，后续每个世界可以单独设置 qpos/qvel/ctrl 来实现 domain randomization
+        default_model_wp = mjwarp.put_model(model_cpu)
+        # pair_margin_override_np = (
+        #     np.zeros((int(config.num_samples), model_cpu.npair)).astype(np.float32)
+        #     + 0.01
+        # )
+        # pair_margin_override_wp = wp.from_numpy(
+        #     pair_margin_override_np, dtype=wp.float32, device=dev
+        # )
+        # default_model_wp.pair_margin = pair_margin_override_wp
+
+        default_data_wp = mjwarp.put_data(
+            model_cpu,
+            data_cpu,
+            nworld=int(config.num_samples),
+            nconmax=int(config.nconmax_per_env),
+            njmax=int(config.njmax_per_env),
+        )
+        data_wp_prev = mjwarp.put_data(
+            model_cpu,
+            data_cpu,
+            nworld=int(config.num_samples),
+            nconmax=int(config.nconmax_per_env),
+            njmax=int(config.njmax_per_env),
+        )
+        default_graph = _compile_step(default_model_wp, default_data_wp, dev)
+        ctrl_low = torch.as_tensor(
+            model_cpu.actuator_ctrlrange[:, 0], device=dev, dtype=torch.float32
+        )
+        ctrl_high = torch.as_tensor(
+            model_cpu.actuator_ctrlrange[:, 1], device=dev, dtype=torch.float32
+        )
+        ctrl_limited = torch.as_tensor(
+            model_cpu.actuator_ctrllimited.astype(bool), device=dev
+        )
+
+    # Initialize env; default active is main
+    return MJWPEnv(
+        model_cpu=model_cpu,
+        data_cpu=data_cpu,
+        model_wp=default_model_wp,
+        data_wp=default_data_wp,
+        data_wp_prev=data_wp_prev,
+        graph=default_graph,
+        device=dev,
+        num_worlds=int(config.num_samples),
+        ctrl_low=ctrl_low,
+        ctrl_high=ctrl_high,
+        ctrl_limited=ctrl_limited,
+    )
+
+
+def _weight_diff_qpos(config: Config) -> torch.Tensor:
+    w = torch.ones(config.nv, device=config.device)
+    if config.robot_type == "asm" and config.embodiment_type in [
+        "bimanual",
+        "right",
+        "left",
+    ]:
+        w[: config.nu] = config.joint_rew_scale
+        arm_joint_weight = (
+            config.arm_joint_rew_scale
+            if config.arm_joint_rew_scale >= 0.0
+            else config.joint_rew_scale
+        )
+        hand_joint_weight = (
+            config.hand_joint_rew_scale
+            if config.hand_joint_rew_scale >= 0.0
+            else config.joint_rew_scale
+        )
+        if config.embodiment_type == "bimanual" and config.nu >= 54:
+            w[0:7] = arm_joint_weight
+            w[7:27] = hand_joint_weight
+            w[27:34] = arm_joint_weight
+            w[34:54] = hand_joint_weight
+        elif config.nu > 7:
+            w[0:7] = arm_joint_weight
+            w[7 : config.nu] = hand_joint_weight
+        if config.nq_obj == 12:
+            w[-12:-9] = config.pos_rew_scale
+            w[-9:-6] = config.rot_rew_scale
+            w[-6:-3] = config.pos_rew_scale
+            w[-3:] = config.rot_rew_scale
+        elif config.nq_obj == 14:
+            w[-12:-9] = config.pos_rew_scale
+            w[-9:-6] = config.rot_rew_scale
+            w[-6:-3] = config.pos_rew_scale
+            w[-3:] = config.rot_rew_scale
+        elif config.nq_obj == 6:
+            w[-6:-3] = config.pos_rew_scale
+            w[-3:] = config.rot_rew_scale
+        elif config.nq_obj == 7:
+            w[-6:-3] = config.pos_rew_scale
+            w[-3:] = config.rot_rew_scale
+    elif config.embodiment_type == "bimanual":
+        half_dof = int(config.nu // 2)
+        w[:3] = config.base_pos_rew_scale
+        w[3:6] = config.base_rot_rew_scale
+        w[6:half_dof] = config.joint_rew_scale
+        w[half_dof : half_dof + 3] = config.base_pos_rew_scale
+        w[half_dof + 3 : half_dof + 6] = config.base_rot_rew_scale
+        w[half_dof + 6 : config.nu] = config.joint_rew_scale
+        # object
+        if config.nq_obj == 12:
+            w[-12:-9] = config.pos_rew_scale
+            w[-9:-6] = config.rot_rew_scale
+            w[-6:-3] = config.pos_rew_scale
+            w[-3:] = config.rot_rew_scale
+        else:
+            w[-12:-9] = config.pos_rew_scale
+            w[-9:-6] = config.rot_rew_scale
+            w[-6:-3] = config.pos_rew_scale
+            w[-3:] = config.rot_rew_scale
+    elif config.embodiment_type in ["right", "left"]:
+        w[:3] = config.base_pos_rew_scale
+        w[3:6] = config.base_rot_rew_scale
+        w[6 : config.nu] = config.joint_rew_scale
+        if config.nq_obj == 6:
+            w[-6:-3] = config.pos_rew_scale
+            w[-3:] = config.rot_rew_scale
+        else:
+            w[-6:-3] = config.pos_rew_scale
+            w[-3:] = config.rot_rew_scale
+    elif config.embodiment_type in ["humanoid"]:  # humanoid robot
+        # robot pos and rot
+        w[:3] = config.pos_rew_scale
+        w[3:6] = config.rot_rew_scale
+        # robot joint
+        w[6:] = config.joint_rew_scale
+    elif config.embodiment_type in ["humanoid_object"]:
+        # robot pos and rot
+        w[:3] = config.base_pos_rew_scale
+        w[3:6] = config.base_rot_rew_scale
+        # robot joint
+        w[6:-6] = config.joint_rew_scale
+        # object pos and rot
+        w[-6:-3] = config.pos_rew_scale
+        w[-3:] = config.rot_rew_scale
+    else:
+        raise ValueError(f"Invalid embodiment_type: {config.embodiment_type}")
+    return w
+
+
+def _diff_qpos(
+    config: Config, qpos_sim: torch.Tensor, qpos_ref: torch.Tensor
+) -> torch.Tensor:
+    """Compute the difference between qpos_sim and qpos_ref
+    TODO: replace with mujoco built-in function, not sure how to call warp internal function yet.
+    """
+    batch_size = qpos_sim.shape[0]
+    qpos_diff = torch.zeros((batch_size, config.nv), device=config.device)
+    if config.embodiment_type == "bimanual":
+        if config.nq_obj == 12:
+            qpos_diff[:, :-12] = qpos_sim[:, :-12] - qpos_ref[:, :-12]
+            qpos_diff[:, -12:-9] = qpos_sim[:, -12:-9] - qpos_ref[:, -12:-9]
+            qpos_diff[:, -9:-6] = qpos_sim[:, -9:-6] - qpos_ref[:, -9:-6]
+            qpos_diff[:, -6:-3] = qpos_sim[:, -6:-3] - qpos_ref[:, -6:-3]
+            qpos_diff[:, -3:] = qpos_sim[:, -3:] - qpos_ref[:, -3:]
+            return qpos_diff
+        # joint
+        qpos_diff[:, :-12] = qpos_sim[:, :-14] - qpos_ref[:, :-14]
+        # position
+        qpos_diff[:, -12:-9] = qpos_sim[:, -14:-11] - qpos_ref[:, -14:-11]
+        qpos_diff[:, -6:-3] = qpos_sim[:, -7:-4] - qpos_ref[:, -7:-4]
+        # rotation
+        qpos_diff[:, -9:-6] = quat_sub(qpos_sim[:, -11:-7], qpos_ref[:, -11:-7])
+        qpos_diff[:, -3:] = quat_sub(qpos_sim[:, -4:], qpos_ref[:, -4:])
+    elif config.embodiment_type in ["right", "left"]:
+        if config.nq_obj == 6:
+            qpos_diff[:, :-6] = qpos_sim[:, :-6] - qpos_ref[:, :-6]
+            qpos_diff[:, -6:-3] = qpos_sim[:, -6:-3] - qpos_ref[:, -6:-3]
+            qpos_diff[:, -3:] = qpos_sim[:, -3:] - qpos_ref[:, -3:]
+            return qpos_diff
+        # joint
+        qpos_diff[:, :-6] = qpos_sim[:, :-7] - qpos_ref[:, :-7]
+        # position
+        qpos_diff[:, -6:-3] = qpos_sim[:, -7:-4] - qpos_ref[:, -7:-4]
+        # rotation
+        qpos_diff[:, -3:] = quat_sub(qpos_sim[:, -4:], qpos_ref[:, -4:])
+    elif config.embodiment_type in ["humanoid"]:
+        # joint
+        qpos_diff[:, 6:] = qpos_sim[:, 7:] - qpos_ref[:, 7:]
+        # position
+        qpos_diff[:, :3] = qpos_sim[:, :3] - qpos_ref[:, :3]
+        # rotation
+        qpos_diff[:, 3:6] = quat_sub(qpos_sim[:, 3:7], qpos_ref[:, 3:7])
+    elif config.embodiment_type in ["humanoid_object"]:
+        qpos_humanoid = qpos_sim[:, :-7]
+        qpos_object = qpos_sim[:, -7:]
+        qpos_ref_humanoid = qpos_ref[:, :-7]
+        qpos_ref_object = qpos_ref[:, -7:]
+        # position
+        qpos_diff[:, :3] = qpos_humanoid[:, :3] - qpos_ref_humanoid[:, :3]
+        # rotation
+        qpos_diff[:, 3:6] = quat_sub(qpos_humanoid[:, 3:7], qpos_ref_humanoid[:, 3:7])
+        # joint
+        qpos_diff[:, 6:-6] = qpos_humanoid[:, 7:] - qpos_ref_humanoid[:, 7:]
+        # object
+        qpos_diff[:, -6:-3] = qpos_object[:, :3] - qpos_ref_object[:, :3]
+        qpos_diff[:, -3:] = quat_sub(qpos_object[:, 3:7], qpos_ref_object[:, 3:7])
+    else:
+        raise ValueError(f"Invalid embodiment_type: {config.embodiment_type}")
+    return qpos_diff
+
+
+def _is_empty_free_object_pose(
+    pose: torch.Tensor, pos_eps: float = 1e-5, quat_eps: float = 1e-5
+) -> torch.Tensor:
+    identity_quat = torch.tensor(
+        [1.0, 0.0, 0.0, 0.0], dtype=pose.dtype, device=pose.device
+    )
+    pos_empty = torch.linalg.vector_norm(pose[:3]) < pos_eps
+    quat_identity = torch.linalg.vector_norm(pose[3:7] - identity_quat) < quat_eps
+    return pos_empty & quat_identity
+
+
+def _mask_empty_object_weights(
+    config: Config, qpos_weight: torch.Tensor, qpos_ref: torch.Tensor
+) -> torch.Tensor:
+    if config.embodiment_type != "bimanual" or config.nq_obj != 14:
+        return qpos_weight
+
+    qpos_weight = qpos_weight.clone()
+    right_object_empty = _is_empty_free_object_pose(qpos_ref[-14:-7])
+    left_object_empty = _is_empty_free_object_pose(qpos_ref[-7:])
+    right_object_valid = (~right_object_empty).to(qpos_weight.dtype)
+    left_object_valid = (~left_object_empty).to(qpos_weight.dtype)
+    qpos_weight[-12:-6] *= right_object_valid
+    qpos_weight[-6:] *= left_object_valid
+    return qpos_weight
+
+
+def _norm_rows(value: torch.Tensor, batch_size: int, device: str) -> torch.Tensor:
+    if value.numel() == 0:
+        return torch.zeros(batch_size, device=device)
+    return torch.norm(value, p=2, dim=1)
+
+
+def _add_norm_diagnostic(
+    info: dict[str, torch.Tensor],
+    name: str,
+    raw_diff: torch.Tensor,
+    weighted_diff: torch.Tensor,
+    batch_size: int,
+    device: str,
+) -> None:
+    dist = _norm_rows(raw_diff, batch_size, device)
+    weighted_dist = _norm_rows(weighted_diff, batch_size, device)
+    info[f"{name}_dist"] = dist
+    info[f"{name}_rew"] = -weighted_dist
+
+
+def _add_asm_qpos_diagnostics(
+    info: dict[str, torch.Tensor],
+    config: Config,
+    qpos_diff: torch.Tensor,
+    delta_qpos: torch.Tensor,
+) -> None:
+    batch_size = qpos_diff.shape[0]
+    groups: dict[str, slice] = {}
+    if config.robot_type == "asm" and config.embodiment_type == "bimanual":
+        groups = {
+            "right_arm_qpos": slice(0, 7),
+            "right_hand_qpos": slice(7, 27),
+            "left_arm_qpos": slice(27, 34),
+            "left_hand_qpos": slice(34, 54),
+        }
+    elif config.robot_type == "asm" and config.embodiment_type in ["right", "left"]:
+        groups = {
+            f"{config.embodiment_type}_arm_qpos": slice(0, 7),
+            f"{config.embodiment_type}_hand_qpos": slice(7, config.nu),
+        }
+
+    for name, group_slice in groups.items():
+        _add_norm_diagnostic(
+            info,
+            name,
+            qpos_diff[:, group_slice],
+            delta_qpos[:, group_slice],
+            batch_size,
+            config.device,
+        )
+
+    if config.embodiment_type == "bimanual":
+        if config.nq_obj == 12:
+            object_groups = {
+                "right_object_pos": slice(-12, -9),
+                "right_object_rot": slice(-9, -6),
+                "left_object_pos": slice(-6, -3),
+                "left_object_rot": slice(-3, None),
+            }
+        else:
+            object_groups = {
+                "right_object_pos": slice(-12, -9),
+                "right_object_rot": slice(-9, -6),
+                "left_object_pos": slice(-6, -3),
+                "left_object_rot": slice(-3, None),
+            }
+    elif config.embodiment_type in ["right", "left"]:
+        object_groups = {
+            f"{config.embodiment_type}_object_pos": slice(-6, -3),
+            f"{config.embodiment_type}_object_rot": slice(-3, None),
+        }
+    else:
+        object_groups = {}
+
+    for name, group_slice in object_groups.items():
+        _add_norm_diagnostic(
+            info,
+            name,
+            qpos_diff[:, group_slice],
+            delta_qpos[:, group_slice],
+            batch_size,
+            config.device,
+        )
+
+
+def _add_asm_qvel_diagnostics(
+    info: dict[str, torch.Tensor],
+    config: Config,
+    qvel_diff: torch.Tensor,
+) -> None:
+    if config.robot_type != "asm":
+        return
+    groups: dict[str, slice] = {}
+    if config.embodiment_type == "bimanual":
+        groups = {
+            "right_arm_qvel": slice(0, 7),
+            "right_hand_qvel": slice(7, 27),
+            "left_arm_qvel": slice(27, 34),
+            "left_hand_qvel": slice(34, 54),
+        }
+    elif config.embodiment_type in ["right", "left"]:
+        groups = {
+            f"{config.embodiment_type}_arm_qvel": slice(0, 7),
+            f"{config.embodiment_type}_hand_qvel": slice(7, config.nu),
+        }
+    for name, group_slice in groups.items():
+        info[f"{name}_dist"] = _norm_rows(
+            qvel_diff[:, group_slice], qvel_diff.shape[0], config.device
+        )
+
+
+def _sum_fingertip_dist_by_side(
+    config: Config,
+    fingertip_dist_per_site: torch.Tensor,
+    side: str,
+) -> torch.Tensor:
+    side_indices = [
+        idx
+        for idx, item in enumerate(config.fingertip_order)
+        if len(item) >= 1 and item[0] == side
+    ]
+    if not side_indices:
+        return torch.zeros(fingertip_dist_per_site.shape[0], device=config.device)
+    side_indices_tensor = torch.as_tensor(
+        side_indices, device=config.device, dtype=torch.long
+    )
+    return fingertip_dist_per_site.index_select(1, side_indices_tensor).sum(dim=1)
+
+
+def get_reward(
+    config: Config,
+    env: MJWPEnv,
+    ref: tuple[torch.Tensor, ...],
+) -> torch.Tensor:
+    """Non-terminal step reward for MJWP batched worlds.
+    ref is a tuple:
+        (qpos_ref, qvel_ref, ctrl_ref, contact_ref, contact_pos_ref[, fingertip_pos_ref])
+    Returns (N,)
+
+    TODO: move reward computation to task-specific module
+    """
+    qpos_ref, qvel_ref, ctrl_ref, contact_ref, contact_pos_ref = ref[:5]
+    fingertip_pos_ref = ref[5] if len(ref) > 5 else None
+    qpos_sim = wp.to_torch(env.data_wp.qpos)
+    qvel_sim = wp.to_torch(env.data_wp.qvel)
+
+    # weighted qpos tracking 关节角
+    qpos_diff = _diff_qpos(
+        config, qpos_sim, qpos_ref.unsqueeze(0).repeat(qpos_sim.shape[0], 1)
+    )
+    qpos_weight = _mask_empty_object_weights(config, _weight_diff_qpos(config), qpos_ref)
+    delta_qpos = qpos_diff * qpos_weight
+    qpos_dist = torch.norm(delta_qpos, p=2, dim=1)
+    qvel_diff = qvel_sim - qvel_ref
+    qvel_dist = torch.norm(qvel_diff, p=2, dim=1)
+
+    qpos_rew = -qpos_dist * 1.0
+    qvel_rew = -config.vel_rew_scale * qvel_dist * 1.0
+
+    # contact reward
+    if config.contact_rew_scale > 0.0 and len(config.contact_site_ids) > 0:
+        site_xpos_torch = wp.to_torch(env.data_wp.site_xpos)
+        contact_pos = site_xpos_torch[:, config.contact_site_ids]
+        contact_dist = torch.norm(contact_pos - contact_pos_ref, p=2, dim=-1)
+        contact_dist_masked = contact_dist * contact_ref.unsqueeze(0)
+        contact_rew = -contact_dist_masked.sum(dim=1)
+    else:
+        contact_rew = torch.zeros(qpos_sim.shape[0], device=config.device)
+
+    right_fingertip_dist = torch.zeros(qpos_sim.shape[0], device=config.device)
+    left_fingertip_dist = torch.zeros(qpos_sim.shape[0], device=config.device)
+    if (
+        config.fingertip_rew_scale > 0.0
+        and fingertip_pos_ref is not None
+        and len(config.fingertip_site_ids) > 0
+        and fingertip_pos_ref.numel() > 0
+    ):
+        site_xpos_torch = wp.to_torch(env.data_wp.site_xpos)
+        fingertip_pos = site_xpos_torch[:, config.fingertip_site_ids]
+        fingertip_dist_per_site = torch.norm(
+            fingertip_pos - fingertip_pos_ref.unsqueeze(0), p=2, dim=-1
+        )
+        fingertip_dist = fingertip_dist_per_site.sum(dim=1)
+        right_fingertip_dist = _sum_fingertip_dist_by_side(
+            config, fingertip_dist_per_site, "right"
+        )
+        left_fingertip_dist = _sum_fingertip_dist_by_side(
+            config, fingertip_dist_per_site, "left"
+        )
+        fingertip_rew = -config.fingertip_rew_scale * fingertip_dist
+    else:
+        fingertip_dist = torch.zeros(qpos_sim.shape[0], device=config.device)
+        fingertip_rew = torch.zeros(qpos_sim.shape[0], device=config.device)
+
+    reward = qpos_rew + qvel_rew + contact_rew + fingertip_rew
+
+    info = {
+        "qpos_dist": qpos_dist,
+        "qvel_dist": qvel_dist,
+        "fingertip_dist": fingertip_dist,
+        "right_fingertip_dist": right_fingertip_dist,
+        "left_fingertip_dist": left_fingertip_dist,
+        "qpos_rew": qpos_rew,
+        "qvel_rew": qvel_rew,
+        "contact_rew": contact_rew,
+        "fingertip_rew": fingertip_rew,
+        "right_fingertip_rew": -config.fingertip_rew_scale * right_fingertip_dist,
+        "left_fingertip_rew": -config.fingertip_rew_scale * left_fingertip_dist,
+        "total_rew": reward,
+    }
+    _add_asm_qpos_diagnostics(info, config, qpos_diff, delta_qpos)
+    _add_asm_qvel_diagnostics(info, config, qvel_diff)
+    return reward, info
+
+
+def get_terminal_reward(
+    config: Config,
+    env: MJWPEnv,
+    ref_slice: tuple[torch.Tensor, ...],
+) -> torch.Tensor:
+    """Terminal reward focusing on object tracking."""
+    # return config.terminal_rew_scale * get_reward(config, env, ref_slice)
+    # qpos_ref, qvel_ref, ctrl_ref, contact_ref, _ = ref_slice
+    # qpos_sim = wp.to_torch(env.data_wp.qpos)
+    # qpos_weight = torch.zeros(qpos_sim.shape[1], device=config.device)
+    # if config.embodiment_type == "bimanual":
+    #     qpos_weight[-14:-11] = config.pos_rew_scale
+    #     qpos_weight[-11:-7] = config.rot_rew_scale
+    #     qpos_weight[-7:-4] = config.pos_rew_scale
+    #     qpos_weight[-4:] = config.rot_rew_scale
+    # elif config.embodiment_type in ["right", "left"]:
+    #     qpos_weight[-7:-4] = config.pos_rew_scale
+    #     qpos_weight[-4:] = config.rot_rew_scale
+    # elif config.embodiment_type in ["CMU", "DanceDB"]:
+    #     qpos_weight[:3] = config.pos_rew_scale
+    #     qpos_weight[3:7] = config.rot_rew_scale
+    # else:
+    #     raise ValueError(f"Invalid embodiment_type: {config.embodiment_type}")
+    # delta_qpos = (qpos_sim - qpos_ref) * qpos_weight
+    # cost_object = config.terminal_rew_scale * torch.sum(delta_qpos**2, dim=1)
+
+    rew, info = get_reward(config, env, ref_slice)
+    terminal_rew = config.terminal_rew_scale * rew
+    return terminal_rew, info
+
+
+def get_terminate(
+    config: Config, env: MJWPEnv, ref_slice: tuple[torch.Tensor, ...]
+) -> torch.Tensor:
+    # compute object position and orientation error, compare to thereshold
+    qpos_sim = wp.to_torch(env.data_wp.qpos)
+    qpos_ref, qvel_ref, ctrl_ref = ref_slice[:3]
+    if config.embodiment_type == "bimanual":
+        if config.nq_obj == 12:
+            right_obj_pos = qpos_sim[:, -12:-9]
+            right_obj_pos_ref = qpos_ref[-12:-9].unsqueeze(0)
+            right_obj_pos_error = torch.norm(
+                right_obj_pos - right_obj_pos_ref, p=2, dim=1
+            )
+            right_obj_rot = qpos_sim[:, -9:-6]
+            right_obj_rot_ref = qpos_ref[-9:-6].unsqueeze(0)
+            right_obj_rot_error = torch.norm(
+                right_obj_rot - right_obj_rot_ref, p=2, dim=1
+            )
+            left_obj_pos = qpos_sim[:, -6:-3]
+            left_obj_pos_ref = qpos_ref[-6:-3].unsqueeze(0)
+            left_obj_pos_error = torch.norm(left_obj_pos - left_obj_pos_ref, p=2, dim=1)
+            left_obj_rot = qpos_sim[:, -3:]
+            left_obj_rot_ref = qpos_ref[-3:].unsqueeze(0)
+            left_obj_rot_error = torch.norm(left_obj_rot - left_obj_rot_ref, p=2, dim=1)
+            if torch.all(right_obj_pos_ref.abs() < 1e-4):
+                right_obj_pos_error *= 0.0
+                right_obj_rot_error *= 0.0
+            if torch.all(left_obj_pos_ref.abs() < 1e-4):
+                left_obj_pos_error *= 0.0
+                left_obj_rot_error *= 0.0
+            terminate = (
+                (left_obj_pos_error > config.object_pos_threshold)
+                | (right_obj_pos_error > config.object_pos_threshold)
+                | (left_obj_rot_error > config.object_rot_threshold)
+                | (right_obj_rot_error > config.object_rot_threshold)
+            )
+            return terminate
+        left_obj_pos = qpos_sim[:, -14:-11]
+        left_obj_pos_ref = qpos_ref[-14:-11].unsqueeze(0)
+        left_obj_pos_error = torch.norm(left_obj_pos - left_obj_pos_ref, p=2, dim=1)
+        left_obj_quat = qpos_sim[:, -11:-7]
+        left_obj_quat_ref = qpos_ref[-11:-7].unsqueeze(0)
+        left_obj_quat_error = torch.norm(
+            quat_sub(left_obj_quat, left_obj_quat_ref.repeat(qpos_sim.shape[0], 1)),
+            p=2,
+            dim=1,
+        )
+        right_obj_pos = qpos_sim[:, -7:-4]
+        right_obj_pos_ref = qpos_ref[-7:-4].unsqueeze(0)
+        right_obj_pos_error = torch.norm(right_obj_pos - right_obj_pos_ref, p=2, dim=1)
+        right_obj_quat = qpos_sim[:, -4:]
+        right_obj_quat_ref = qpos_ref[-4:].unsqueeze(0)
+        right_obj_quat_error = torch.norm(
+            quat_sub(right_obj_quat, right_obj_quat_ref.repeat(qpos_sim.shape[0], 1)),
+            p=2,
+            dim=1,
+        )
+        # special case: only have left object
+        if torch.all(right_obj_pos_ref.abs() < 1e-4):
+            right_obj_pos_error *= 0.0
+            right_obj_quat_error *= 0.0
+        # special case: only have right object
+        if torch.all(left_obj_pos_ref.abs() < 1e-4):
+            left_obj_pos_error *= 0.0
+            left_obj_quat_error *= 0.0
+        terminate = (
+            (left_obj_pos_error > config.object_pos_threshold)
+            | (right_obj_pos_error > config.object_pos_threshold)
+            | (left_obj_quat_error > config.object_rot_threshold)
+            | (right_obj_quat_error > config.object_rot_threshold)
+        )
+    elif config.embodiment_type in ["right", "left"]:
+        if config.nq_obj == 6:
+            obj_pos = qpos_sim[:, -6:-3]
+            obj_pos_ref = qpos_ref[-6:-3].unsqueeze(0)
+            obj_pos_error = torch.norm(obj_pos - obj_pos_ref, p=2, dim=1)
+            obj_rot = qpos_sim[:, -3:]
+            obj_rot_ref = qpos_ref[-3:].unsqueeze(0)
+            obj_rot_error = torch.norm(obj_rot - obj_rot_ref, p=2, dim=1)
+            terminate = (obj_pos_error > config.object_pos_threshold) | (
+                obj_rot_error > config.object_rot_threshold
+            )
+            return terminate
+        obj_pos = qpos_sim[:, -7:-4]
+        obj_pos_ref = qpos_ref[-7:-4].unsqueeze(0)
+        obj_pos_error = torch.norm(obj_pos - obj_pos_ref, p=2, dim=1)
+        obj_quat = qpos_sim[:, -4:]
+        obj_quat_ref = qpos_ref[-4:].unsqueeze(0)
+        obj_quat_error = torch.norm(
+            quat_sub(obj_quat, obj_quat_ref.repeat(qpos_sim.shape[0], 1)), p=2, dim=1
+        )
+        terminate = (obj_pos_error > config.object_pos_threshold) | (
+            obj_quat_error > config.object_rot_threshold
+        )
+    elif config.embodiment_type in ["humanoid", "humanoid_object"]:
+        base_pos = qpos_sim[:, :3]
+        base_pos_ref = qpos_ref[:3].unsqueeze(0)
+        base_pos_error = torch.norm(base_pos - base_pos_ref, p=2, dim=1)
+        base_quat = qpos_sim[:, 3:7]
+        base_quat_ref = qpos_ref[3:7].unsqueeze(0)
+        base_quat_error = torch.norm(
+            quat_sub(base_quat, base_quat_ref.repeat(qpos_sim.shape[0], 1)), p=2, dim=1
+        )
+        terminate = (base_pos_error > config.base_pos_threshold) | (
+            base_quat_error > config.base_rot_threshold
+        )
+    else:
+        raise ValueError(f"Invalid embodiment_type: {config.embodiment_type}")
+    return terminate
+
+
+def get_qpos(config: Config, env: MJWPEnv) -> torch.Tensor:
+    return wp.to_torch(env.data_wp.qpos)
+
+
+def set_qpos(config: Config, env: MJWPEnv, qpos: torch.Tensor):
+    qpos = qpos.to(config.device)
+    if qpos.dim() == 1:
+        qpos = qpos.unsqueeze(0).repeat(env.num_worlds, 1)
+    wp.copy(env.data_wp.qpos, wp.from_torch(qpos))
+    # reset velocities/time as well for consistency
+    zero_qvel = torch.zeros((env.num_worlds, env.model_cpu.nv), device=config.device)
+    wp.copy(env.data_wp.qvel, wp.from_torch(zero_qvel))
+    wp.copy(
+        env.data_wp.time,
+        wp.from_torch(
+            torch.zeros(env.num_worlds, dtype=torch.float32, device=config.device)
+        ),
+    )
+
+
+def get_qvel(config: Config, env: MJWPEnv) -> torch.Tensor:
+    return wp.to_torch(env.data_wp.qvel)
+
+
+def compute_contact_point_delta(
+    contact_mask_step: torch.Tensor,
+    contact_pos_ref_step: torch.Tensor,
+    site_xpos: torch.Tensor,
+    hand_contact_site_ids: list[int | None],
+    contact_indices: list[int],
+) -> torch.Tensor | None:
+    """Compute mean contact position delta for a hand (current - reference).
+
+    Args:
+        contact_mask_step: (N_contact,) mask for active contacts.
+        contact_pos_ref_step: (N_contact, 3) reference contact positions.
+        site_xpos: (N_site, 3) current site positions for the active world.
+        hand_contact_site_ids: list mapping contact indices to site ids (None if missing).
+        contact_indices: indices for the hand contacts to aggregate.
+    """
+    current_positions = []
+    reference_positions = []
+    for idx in contact_indices:
+        if idx >= len(hand_contact_site_ids) or idx >= contact_pos_ref_step.shape[0]:
+            continue
+        sid = hand_contact_site_ids[idx]
+        if sid is None or contact_mask_step[idx] <= 0.5:
+            continue
+        current_positions.append(site_xpos[sid])
+        reference_positions.append(contact_pos_ref_step[idx])
+
+    if not current_positions:
+        return None
+
+    current_mean = torch.stack(current_positions, dim=0).mean(dim=0)
+    reference_mean = torch.stack(reference_positions, dim=0).mean(dim=0)
+    return current_mean - reference_mean
+
+
+def get_trace(config: Config, env: MJWPEnv) -> torch.Tensor:
+    """Return per-world trace points used for visualization. Minimal default returns
+    an empty trace set of shape (N, 0, 3) when not configured.
+    """
+    site_xpos = wp.to_torch(env.data_wp.site_xpos)  # (N, nsite, 3)
+    return site_xpos[:, config.trace_site_ids, :]
+
+
+def save_state(env: MJWPEnv):
+    """Clone the essential set of Warp arrays to restore later.
+    Includes core state variables and key derived quantities.
+    """
+    _copy_state(env.data_wp, env.data_wp_prev)
+    return env
+    # qpos = wp.clone(env.data_wp.qpos)
+    # qvel = wp.clone(env.data_wp.qvel)
+    # qacc = wp.clone(env.data_wp.qacc)
+    # time_arr = wp.clone(env.data_wp.time)
+    # ctrl = wp.clone(env.data_wp.ctrl) if hasattr(env.data_wp, "ctrl") else None
+    # act = wp.clone(env.data_wp.act) if hasattr(env.data_wp, "act") else None
+    # act_dot = wp.clone(env.data_wp.act_dot) if hasattr(env.data_wp, "act_dot") else None
+    # site_xpos = wp.clone(env.data_wp.site_xpos)
+    # site_xmat = wp.clone(env.data_wp.site_xmat)
+    # mocap_pos = (
+    #     wp.clone(env.data_wp.mocap_pos) if hasattr(env.data_wp, "mocap_pos") else None
+    # )
+    # mocap_quat = (
+    #     wp.clone(env.data_wp.mocap_quat) if hasattr(env.data_wp, "mocap_quat") else None
+    # )
+    # energy = wp.clone(env.data_wp.energy) if hasattr(env.data_wp, "energy") else None
+    # return (
+    #     qpos,
+    #     qvel,
+    #     qacc,
+    #     time_arr,
+    #     ctrl,
+    #     act,
+    #     act_dot,
+    #     site_xpos,
+    #     site_xmat,
+    #     mocap_pos,
+    #     mocap_quat,
+    #     energy,
+    # )
+
+
+def load_state(env: MJWPEnv, state):
+    _copy_state(env.data_wp_prev, env.data_wp)
+    return env
+    # (
+    #     qpos,
+    #     qvel,
+    #     qacc,
+    #     time_arr,
+    #     ctrl,
+    #     act,
+    #     act_dot,
+    #     site_xpos,
+    #     site_xmat,
+    #     mocap_pos,
+    #     mocap_quat,
+    #     energy,
+    # ) = state
+    # wp.copy(env.data_wp.qpos, qpos)
+    # wp.copy(env.data_wp.qvel, qvel)
+    # wp.copy(env.data_wp.qacc, qacc)
+    # wp.copy(env.data_wp.time, time_arr)
+    # if ctrl is not None and hasattr(env.data_wp, "ctrl"):
+    #     wp.copy(env.data_wp.ctrl, ctrl)
+    # if act is not None and hasattr(env.data_wp, "act"):
+    #     wp.copy(env.data_wp.act, act)
+    # if act_dot is not None and hasattr(env.data_wp, "act_dot"):
+    #     wp.copy(env.data_wp.act_dot, act_dot)
+    # if mocap_pos is not None and hasattr(env.data_wp, "mocap_pos"):
+    #     wp.copy(env.data_wp.mocap_pos, mocap_pos)
+    # if mocap_quat is not None and hasattr(env.data_wp, "mocap_quat"):
+    #     wp.copy(env.data_wp.mocap_quat, mocap_quat)
+    # if energy is not None and hasattr(env.data_wp, "energy"):
+    #     wp.copy(env.data_wp.energy, energy)
+    # if site_xpos is not None and hasattr(env.data_wp, "site_xpos"):
+    #     wp.copy(env.data_wp.site_xpos, site_xpos)
+    # if site_xmat is not None and hasattr(env.data_wp, "site_xmat"):
+    #     wp.copy(env.data_wp.site_xmat, site_xmat)
+    # return env
+
+
+def apply_perturbation(config: Config, env: MJWPEnv):
+    # get object id
+    right_obj_id = mujoco.mj_name2id(
+        env.model_cpu, mujoco.mjtObj.mjOBJ_BODY, "right_object"
+    )
+    left_obj_id = mujoco.mj_name2id(
+        env.model_cpu, mujoco.mjtObj.mjOBJ_BODY, "left_object"
+    )
+    xfrc_applied = wp.to_torch(env.data_wp.xfrc_applied)
+    if right_obj_id != -1:
+        xfrc_applied[:, right_obj_id, :3] = config.perturb_force
+        xfrc_applied[:, right_obj_id, 3:] = config.perturb_torque
+    if left_obj_id != -1:
+        xfrc_applied[:, left_obj_id, :3] = config.perturb_force
+        xfrc_applied[:, left_obj_id, 3:] = config.perturb_torque
+    wp.copy(env.data_wp.xfrc_applied, wp.from_torch(xfrc_applied))
+    return env
+
+
+def clamp_ctrl_to_actuator_range(env: MJWPEnv, ctrl_mujoco: torch.Tensor) -> torch.Tensor:
+    ctrl = ctrl_mujoco.to(device=env.ctrl_low.device, dtype=torch.float32)
+    if not bool(torch.any(env.ctrl_limited).item()):
+        return ctrl
+    ctrl = ctrl.clone()
+    limited = env.ctrl_limited
+    ctrl[..., limited] = torch.clamp(
+        ctrl[..., limited],
+        env.ctrl_low[limited],
+        env.ctrl_high[limited],
+    )
+    return ctrl
+
+
+def step_env(config: Config, env: MJWPEnv, ctrl_mujoco: torch.Tensor):
+    """Step all worlds with provided MuJoCo-format controls of shape (N, nu)."""
+    if ctrl_mujoco.dim() == 1:
+        ctrl_mujoco = ctrl_mujoco.unsqueeze(0).repeat(env.num_worlds, 1)
+    ctrl_mujoco = clamp_ctrl_to_actuator_range(env, ctrl_mujoco)
+    # Ensure we operate on the correct CUDA context/device
+    with wp.ScopedDevice(env.device):
+        # apply perturbation
+        env = apply_perturbation(config, env)
+        # step control
+        # 推进仿真的函数
+        wp.copy(env.data_wp.ctrl, wp.from_torch(ctrl_mujoco))
+        if env.graph is None:
+            mjwarp.step(env.model_wp, env.data_wp)
+        else:
+            wp.capture_launch(env.graph)
+
+
+def save_env_params(config: Config, env: MJWPEnv):
+    """Save the current simulation parameters."""
+    # Only record which group is active; parameters are embedded in separate models
+    # TODO: explicitly read pair_margin and xy_offset from env.data_wp
+    # currently we choose this solution since pair_margin has a huge virtual dimension,
+    # convert it to torch would lead to OOM
+    pair_margin = 0.0
+    xy_offset = 0.0
+    return {"pair_margin": pair_margin, "xy_offset": xy_offset}
+
+
+def load_env_params(config: Config, env: MJWPEnv, env_param: dict):
+    """Load the simulation parameters.
+
+    Parameters to be updated:
+    - pair_margin
+    - xy_offset of the object
+    """
+    # update model parameters (pair_margin)
+    if "pair_margin" in env_param:
+        pair_margin_single_np = np.full(
+            shape=(config.npair,), fill_value=env_param["pair_margin"], dtype=np.float32
+        )
+
+        # 2. Copy this small array to the GPU
+        pair_margin_override_wp = wp.from_numpy(
+            pair_margin_single_np, dtype=wp.float32, device=config.device
+        )
+
+        # 3. Apply the stride trick to broadcast it
+        # This makes Warp treat the single instance as if it were num_samples copies
+        # without allocating any new memory.
+        pair_margin_override_wp.strides = (0,) + pair_margin_override_wp.strides
+        pair_margin_override_wp.shape = (
+            config.num_samples,
+        ) + pair_margin_override_wp.shape
+        pair_margin_override_wp.ndim += 1
+        wp.copy(env.model_wp.pair_margin, pair_margin_override_wp)
+
+    # update object position (NOTE: currently, xy_offset is only one scalar, which means we only update in the diagonal direction)
+    if "xy_offset" in env_param:
+        qpos_override_th = wp.to_torch(env.data_wp.qpos)
+        # TODO: make object pos detection automatic
+        if config.embodiment_type == "bimanual":
+            qpos_override_th[:, -14:-12] = (
+                qpos_override_th[:, -14:-12] + env_param["xy_offset"]
+            )
+            qpos_override_th[:, -12:-10] = (
+                qpos_override_th[:, -12:-10] + env_param["xy_offset"]
+            )
+        elif config.embodiment_type in ["right", "left"]:
+            qpos_override_th[:, -7:-5] = (
+                qpos_override_th[:, -7:-5] + env_param["xy_offset"]
+            )
+
+        wp.copy(env.data_wp.qpos, wp.from_torch(qpos_override_th))
+
+    # update object actuator gains
+    if "kp" in env_param or "kd" in env_param:
+        actuator_ids = config.object_actuator_ids
+        if not actuator_ids:
+            loguru.logger.warning(
+                "Object actuator ids are empty; skipping kp/kd updates."
+            )
+        else:
+            kp = env_param.get("kp")
+            kd = env_param.get("kd")
+            if kp is None or kd is None:
+                loguru.logger.warning(
+                    "Both kp and kd are required to update actuator gains; skipping."
+                )
+            else:
+                kp_np = np.asarray(kp, dtype=np.float32)
+                kd_np = np.asarray(kd, dtype=np.float32)
+                if kp_np.ndim == 0:
+                    kp_np = np.full((len(actuator_ids),), kp_np, dtype=np.float32)
+                if kd_np.ndim == 0:
+                    kd_np = np.full((len(actuator_ids),), kd_np, dtype=np.float32)
+                if kp_np.shape[0] != len(actuator_ids) or kd_np.shape[0] != len(
+                    actuator_ids
+                ):
+                    raise ValueError(
+                        "kp/kd size mismatch for object actuators: "
+                        f"kp={kp_np.shape}, kd={kd_np.shape}, "
+                        f"expected={len(actuator_ids)}"
+                    )
+
+                # Update CPU model (used for viewer and as source of truth)
+                env.model_cpu.actuator_gainprm[actuator_ids, 0] = kp_np
+                env.model_cpu.actuator_biasprm[actuator_ids, 1] = -kd_np
+
+                # Propagate to MJWarp model if available
+                if hasattr(env.model_wp, "actuator_gainprm") and hasattr(
+                    env.model_wp, "actuator_biasprm"
+                ):
+                    gain_full = np.array(
+                        env.model_cpu.actuator_gainprm, dtype=np.float32
+                    )
+                    bias_full = np.array(
+                        env.model_cpu.actuator_biasprm, dtype=np.float32
+                    )
+                    wp.copy(
+                        env.model_wp.actuator_gainprm,
+                        wp.from_numpy(
+                            gain_full, dtype=wp.float32, device=config.device
+                        ),
+                    )
+                    wp.copy(
+                        env.model_wp.actuator_biasprm,
+                        wp.from_numpy(
+                            bias_full, dtype=wp.float32, device=config.device
+                        ),
+                    )
+                else:
+                    loguru.logger.warning(
+                        "MJWarp model has no actuator_gainprm/biasprm; updated CPU model only."
+                    )
+
+    return env
+
+
+def _to_torch_field(data_wp, name: str, *, required: bool = False) -> torch.Tensor | None:
+    try:
+        return wp.to_torch(getattr(data_wp, name))
+    except (TypeError, ValueError) as exc:
+        if required:
+            raise
+        loguru.logger.debug("Skipping MJWP state field {}: {}", name, exc)
+        return None
+
+
+def _repeat_first_world(tensor: torch.Tensor, num_worlds: int) -> torch.Tensor:
+    if tensor.numel() == 0:
+        return tensor
+    first = tensor[:1]
+    repeats = (num_worlds,) + (1,) * (first.dim() - 1)
+    return first.repeat(*repeats)
+
+
+def _broadcast_field(
+    data_wp,
+    name: str,
+    num_worlds: int,
+    *,
+    required: bool = False,
+):
+    tensor = _to_torch_field(data_wp, name, required=required)
+    if tensor is None or tensor.numel() == 0:
+        return
+    wp.copy(getattr(data_wp, name), wp.from_torch(_repeat_first_world(tensor, num_worlds)))
+
+
+def _broadcast_state(data_wp, num_worlds: int):
+    """Broadcast state from first world/env to all worlds/envs.
+
+    This is a generic function that can be used by both MJWP and HDMI simulators.
+
+    Args:
+        data_wp: MuJoCo Warp data object (mjwarp.Data or wrapped version)
+        num_worlds: Number of parallel worlds/environments
+    """
+    for name, required in [
+        ("qpos", True),
+        ("qvel", True),
+        ("time", True),
+        ("ctrl", True),
+        ("qacc", False),
+        ("act", False),
+        ("act_dot", False),
+        ("qfrc_applied", False),
+        ("xfrc_applied", False),
+        ("mocap_pos", False),
+        ("mocap_quat", False),
+        ("xpos", False),
+        ("xquat", False),
+        ("xmat", False),
+        ("geom_xpos", False),
+        ("geom_xmat", False),
+        ("site_xpos", False),
+    ]:
+        _broadcast_field(data_wp, name, num_worlds, required=required)
+
+
+def sync_env(config: Config, env: MJWPEnv, mj_data: mujoco.MjData):
+    """Broadcast the state from first env to all envs
+
+    This function synchronizes states from the first environment to all environments.
+    Uses safe copying with buffer size validation to avoid mismatches.
+    """
+    _broadcast_state(env.data_wp, env.num_worlds)
+
+
+def sync_env_mujoco(config: Config, env: MJWPEnv, mj_data: mujoco.MjData):
+    """Sync state from mj_data to env.data_wp"""
+    # Define field mappings with their data and target shapes
+    fields = [
+        # Core state variables
+        ("qpos", mj_data.qpos, (env.data_wp.nworld, -1)),
+        ("qvel", mj_data.qvel, (env.data_wp.nworld, -1)),
+        ("qacc", mj_data.qacc, (env.data_wp.nworld, -1)),
+        ("time", np.array([mj_data.time], dtype=np.float32), (env.data_wp.nworld, 1)),
+        ("ctrl", mj_data.ctrl, (env.data_wp.nworld, -1)),
+        ("act", mj_data.act, (env.data_wp.nworld, -1)),
+        ("act_dot", mj_data.act_dot, (env.data_wp.nworld, -1)),
+        ("qacc_warmstart", mj_data.qacc_warmstart, (env.data_wp.nworld, -1)),
+        # Forces
+        ("qfrc_applied", mj_data.qfrc_applied, (env.data_wp.nworld, -1)),
+        ("xfrc_applied", mj_data.xfrc_applied, (env.data_wp.nworld, -1, -1)),
+        # Energy (2D: kinetic + potential)
+        ("energy", mj_data.energy, (env.data_wp.nworld, 2)),
+        # Mocap data
+        ("mocap_pos", mj_data.mocap_pos, (env.data_wp.nworld, -1, 3)),
+        ("mocap_quat", mj_data.mocap_quat, (env.data_wp.nworld, -1, 4)),
+        # Spatial transformations
+        ("xpos", mj_data.xpos, (env.data_wp.nworld, -1, 3)),
+        ("xquat", mj_data.xquat, (env.data_wp.nworld, -1, 4)),
+        ("xmat", mj_data.xmat, (env.data_wp.nworld, -1, 9)),
+        ("xipos", mj_data.xipos, (env.data_wp.nworld, -1, 3)),
+        ("ximat", mj_data.ximat, (env.data_wp.nworld, -1, 9)),
+        # Geometry positions
+        ("geom_xpos", mj_data.geom_xpos, (env.data_wp.nworld, -1, 3)),
+        ("geom_xmat", mj_data.geom_xmat, (env.data_wp.nworld, -1, 9)),
+        ("site_xpos", mj_data.site_xpos, (env.data_wp.nworld, -1, 3)),
+        ("site_xmat", mj_data.site_xmat, (env.data_wp.nworld, -1, 9)),
+        # Body dynamics (spatial vectors)
+        ("cacc", mj_data.cacc, (env.data_wp.nworld, -1, 6)),
+        ("cfrc_int", mj_data.cfrc_int, (env.data_wp.nworld, -1, 6)),
+        ("cfrc_ext", mj_data.cfrc_ext, (env.data_wp.nworld, -1, 6)),
+        # Sensor data
+        ("sensordata", mj_data.sensordata, (env.data_wp.nworld, -1)),
+        # Actuator data
+        ("actuator_length", mj_data.actuator_length, (env.data_wp.nworld, -1)),
+        ("actuator_velocity", mj_data.actuator_velocity, (env.data_wp.nworld, -1)),
+        ("actuator_force", mj_data.actuator_force, (env.data_wp.nworld, -1)),
+        # Tendon data
+        ("ten_length", mj_data.ten_length, (env.data_wp.nworld, -1)),
+        ("ten_velocity", mj_data.ten_velocity, (env.data_wp.nworld, -1)),
+    ]
+
+    # Contact struct fields - these need special handling
+    contact_fields = [
+        ("dist", "contact.dist"),
+        ("pos", "contact.pos"),
+        ("frame", "contact.frame"),
+        ("includemargin", "contact.includemargin"),
+        ("friction", "contact.friction"),
+        ("solref", "contact.solref"),
+        ("solreffriction", "contact.solreffriction"),
+        ("solimp", "contact.solimp"),
+        ("dim", "contact.dim"),
+        ("geom", "contact.geom"),
+        ("efc_address", "contact.efc_address"),
+        ("worldid", "contact.worldid"),
+    ]
+
+    # Constraint (efc) fields - these are direct fields on mj_data, not nested in a struct
+    efc_fields = [
+        ("efc_type", "efc.type"),
+        ("efc_id", "efc.id"),
+        ("efc_J", "efc.J"),
+        ("efc_pos", "efc.pos"),
+        ("efc_margin", "efc.margin"),
+        ("efc_D", "efc.D"),
+        ("efc_vel", "efc.vel"),
+        ("efc_aref", "efc.aref"),
+        ("efc_frictionloss", "efc.frictionloss"),
+        ("efc_force", "efc.force"),
+    ]
+
+    # Copy data to all environments
+    for field_name, source_data, target_shape in fields:
+        # Skip if field doesn't exist in either source or destination
+        if not hasattr(mj_data, field_name) or not hasattr(env.data_wp, field_name):
+            continue
+
+        source_data_np = np.array(source_data, dtype=np.float32)
+        tensor = torch.from_numpy(source_data_np).to(config.device)
+
+        # Handle scalar time field
+        if tensor.dim() == 0:
+            tensor = tensor.unsqueeze(0)
+
+        # Reshape tensor to match target shape
+        if len(target_shape) == 2:
+            if tensor.dim() == 1:
+                tensor = tensor.unsqueeze(0).repeat(target_shape[0], 1)
+            elif tensor.dim() == 2:
+                tensor = tensor.unsqueeze(0).repeat(target_shape[0], 1, 1).squeeze(-1)
+        elif len(target_shape) == 3:
+            if tensor.dim() == 1:
+                # For 1D data that needs to be 3D
+                tensor = (
+                    tensor.unsqueeze(0)
+                    .unsqueeze(-1)
+                    .repeat(target_shape[0], 1, target_shape[2])
+                )
+            elif tensor.dim() == 2:
+                tensor = tensor.unsqueeze(0).repeat(target_shape[0], 1, 1)
+            elif tensor.dim() == 3:
+                tensor = tensor.unsqueeze(0).repeat(target_shape[0], 1, 1, 1).squeeze(1)
+        elif len(target_shape) == 4:
+            tensor = tensor.unsqueeze(0).repeat(target_shape[0], 1, 1, 1)
+
+        wp.copy(getattr(env.data_wp, field_name), wp.from_torch(tensor))
+
+    # Handle contact struct fields
+    for mj_field, wp_field in contact_fields:
+        if hasattr(mj_data.contact, mj_field):
+            source_data = getattr(mj_data.contact, mj_field)
+            source_data_np = np.array(source_data, dtype=np.float32)
+            tensor = torch.from_numpy(source_data_np).to(config.device)
+
+            # Handle scalar fields
+            if tensor.dim() == 0:
+                tensor = tensor.unsqueeze(0)
+
+            # Reshape for batched environments
+            if tensor.dim() == 1:
+                tensor = tensor.unsqueeze(0).repeat(env.data_wp.nworld, 1)
+            elif tensor.dim() == 2:
+                tensor = tensor.unsqueeze(0).repeat(env.data_wp.nworld, 1, 1)
+            elif tensor.dim() == 3:
+                tensor = tensor.unsqueeze(0).repeat(env.data_wp.nworld, 1, 1, 1)
+
+            # Get the destination field using nested attribute access
+            dst_obj = env.data_wp
+            for attr in wp_field.split("."):
+                dst_obj = getattr(dst_obj, attr)
+            wp.copy(dst_obj, wp.from_torch(tensor))
+
+    # Handle efc fields - these are direct fields on mj_data
+    for mj_field, wp_field in efc_fields:
+        if hasattr(mj_data, mj_field):
+            source_data = getattr(mj_data, mj_field)
+            source_data_np = np.array(source_data, dtype=np.float32)
+            tensor = torch.from_numpy(source_data_np).to(config.device)
+
+            # Handle scalar fields
+            if tensor.dim() == 0:
+                tensor = tensor.unsqueeze(0)
+
+            # Reshape for batched environments
+            if tensor.dim() == 1:
+                tensor = tensor.unsqueeze(0).repeat(env.data_wp.nworld, 1)
+            elif tensor.dim() == 2:
+                tensor = tensor.unsqueeze(0).repeat(env.data_wp.nworld, 1, 1)
+            elif tensor.dim() == 3:
+                tensor = tensor.unsqueeze(0).repeat(env.data_wp.nworld, 1, 1, 1)
+
+            # Get the destination field using nested attribute access
+            dst_obj = env.data_wp
+            for attr in wp_field.split("."):
+                dst_obj = getattr(dst_obj, attr)
+            wp.copy(dst_obj, wp.from_torch(tensor))
+
+    return env
+
+
+def copy_sample_state(
+    config: Config, env: MJWPEnv, src_indices: torch.Tensor, dst_indices: torch.Tensor
+):
+    """Copy simulation state from source samples to destination samples.
+
+    Args:
+        config: Config
+        env: MJWPEnv environment
+        src_indices: Tensor of shape (n,) containing source sample indices
+        dst_indices: Tensor of shape (n,) containing destination sample indices
+    """
+    # Convert to numpy for indexing
+    src_idx = src_indices.cpu().numpy()
+    dst_idx = dst_indices.cpu().numpy()
+
+    for name, required in [
+        ("qpos", True),
+        ("qvel", True),
+        ("qacc", False),
+        ("time", True),
+        ("ctrl", True),
+        ("act", False),
+        ("act_dot", False),
+        ("qacc_warmstart", False),
+        ("qfrc_applied", False),
+        ("xfrc_applied", False),
+        ("energy", False),
+        ("mocap_pos", False),
+        ("mocap_quat", False),
+        ("xpos", False),
+        ("xquat", False),
+        ("xmat", False),
+        ("xipos", False),
+        ("ximat", False),
+        ("geom_xpos", False),
+        ("geom_xmat", False),
+        ("site_xpos", False),
+        ("site_xmat", False),
+        ("cacc", False),
+        ("cfrc_int", False),
+        ("cfrc_ext", False),
+        ("sensordata", False),
+        ("actuator_length", False),
+        ("actuator_velocity", False),
+        ("actuator_force", False),
+        ("ten_length", False),
+        ("ten_velocity", False),
+    ]:
+        tensor = _to_torch_field(env.data_wp, name, required=required)
+        if tensor is None or tensor.numel() == 0:
+            continue
+        tensor[dst_idx] = tensor[src_idx]
+        wp.copy(getattr(env.data_wp, name), wp.from_torch(tensor))
+
+
+def _copy_state(src: mjwarp.Data, dst: mjwarp.Data):
+    """Copy the state from src to dst
+
+    TODO: this function is a temporary solution for domain randomization. A better way should be defining a new warp kernel to update simulation parameter accordingly.
+
+    Args:
+        src: mjwarp.Data
+            the source data to be copied from
+        dst: mjwarp.Data
+            the destination data to be copied to
+    """
+    # Core state variables
+    wp.copy(dst.qpos, src.qpos)
+    wp.copy(dst.qvel, src.qvel)
+    wp.copy(dst.qacc, src.qacc)
+    wp.copy(dst.time, src.time)
+    wp.copy(dst.ctrl, src.ctrl)
+    wp.copy(dst.act, src.act)
+    wp.copy(dst.act_dot, src.act_dot)
+    wp.copy(dst.qacc_warmstart, src.qacc_warmstart)
+
+    # Forces and applied forces
+    wp.copy(dst.qfrc_applied, src.qfrc_applied)
+    wp.copy(dst.xfrc_applied, src.xfrc_applied)
+
+    # Energy tracking
+    wp.copy(dst.energy, src.energy)
+
+    # Mocap data
+    wp.copy(dst.mocap_pos, src.mocap_pos)
+    wp.copy(dst.mocap_quat, src.mocap_quat)
+
+    # Spatial transformations
+    wp.copy(dst.xpos, src.xpos)
+    wp.copy(dst.xquat, src.xquat)
+    wp.copy(dst.xmat, src.xmat)
+    wp.copy(dst.xipos, src.xipos)
+    wp.copy(dst.ximat, src.ximat)
+
+    # Geometry positions
+    wp.copy(dst.geom_xpos, src.geom_xpos)
+    wp.copy(dst.geom_xmat, src.geom_xmat)
+    wp.copy(dst.site_xpos, src.site_xpos)
+    wp.copy(dst.site_xmat, src.site_xmat)
+
+    # Camera and lighting (if present)
+    if hasattr(src, "cam_xpos") and hasattr(dst, "cam_xpos"):
+        wp.copy(dst.cam_xpos, src.cam_xpos)
+        wp.copy(dst.cam_xmat, src.cam_xmat)
+    if hasattr(src, "light_xpos") and hasattr(dst, "light_xpos"):
+        wp.copy(dst.light_xpos, src.light_xpos)
+        wp.copy(dst.light_xdir, src.light_xdir)
+
+    # Body dynamics
+    wp.copy(dst.cacc, src.cacc)
+    wp.copy(dst.cfrc_int, src.cfrc_int)
+    wp.copy(dst.cfrc_ext, src.cfrc_ext)
+
+    # Sensor data
+    wp.copy(dst.sensordata, src.sensordata)
+
+    # Actuator data
+    wp.copy(dst.actuator_length, src.actuator_length)
+    wp.copy(dst.actuator_velocity, src.actuator_velocity)
+    wp.copy(dst.actuator_force, src.actuator_force)
+
+    # Tendon data
+    wp.copy(dst.ten_length, src.ten_length)
+    wp.copy(dst.ten_velocity, src.ten_velocity)
+
+    # Contact struct - copy all fields
+    wp.copy(dst.contact.dist, src.contact.dist)
+    wp.copy(dst.contact.pos, src.contact.pos)
+    wp.copy(dst.contact.frame, src.contact.frame)
+    wp.copy(dst.contact.includemargin, src.contact.includemargin)
+    wp.copy(dst.contact.friction, src.contact.friction)
+    wp.copy(dst.contact.solref, src.contact.solref)
+    wp.copy(dst.contact.solreffriction, src.contact.solreffriction)
+    wp.copy(dst.contact.solimp, src.contact.solimp)
+    wp.copy(dst.contact.dim, src.contact.dim)
+    wp.copy(dst.contact.geom, src.contact.geom)
+    wp.copy(dst.contact.efc_address, src.contact.efc_address)
+    wp.copy(dst.contact.worldid, src.contact.worldid)
+
+    # Constraint (efc) struct - copy all fields
+    wp.copy(dst.efc.type, src.efc.type)
+    wp.copy(dst.efc.id, src.efc.id)
+    wp.copy(dst.efc.J, src.efc.J)
+    wp.copy(dst.efc.pos, src.efc.pos)
+    wp.copy(dst.efc.margin, src.efc.margin)
+    wp.copy(dst.efc.D, src.efc.D)
+    wp.copy(dst.efc.vel, src.efc.vel)
+    wp.copy(dst.efc.aref, src.efc.aref)
+    wp.copy(dst.efc.frictionloss, src.efc.frictionloss)
+    wp.copy(dst.efc.force, src.efc.force)
+    # Note: The workspace fields (Jaref, Ma, grad, etc.) are typically not needed for state transfer
+    # as they are recomputed during solving, but include if needed:
+    # wp.copy(dst.efc.Jaref, src.efc.Jaref)
+    # wp.copy(dst.efc.Ma, src.efc.Ma)
+    # wp.copy(dst.efc.grad, src.efc.grad)
+    # ... (other workspace fields)
+    #
+    return dst

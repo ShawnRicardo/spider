@@ -1,0 +1,24 @@
+# Ignore hidden files and hidden directories
+.*
+!.gitignore
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local/runtime caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Project data and generated outputs
+preprocessed/
+example_datasets/
+
+# Logs and temp files
+*.log
+*.tmp
+*.bak
+.DS_Store

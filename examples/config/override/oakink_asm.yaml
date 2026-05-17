@@ -1,0 +1,50 @@
+# @package _global_
+# Conservative MJWP settings for the full ASM dual-arm dual-hand robot.
+dataset_name: oakink
+robot_type: asm
+embodiment_type: bimanual
+task: pick_spoon_bowl
+data_id: 0
+
+viewer: none
+show_viewer: false
+rerun_spawn: false
+save_video: true
+save_info: true
+save_metrics: true
+save_config: true
+wait_on_finish: false
+contact_guidance: true
+
+num_samples: 64
+max_num_iterations: 4
+temperature: 0.3
+horizon: 1.0
+ctrl_dt: 0.1
+knot_dt: 0.1
+nconmax_per_env: 1024
+njmax_per_env: 2048
+improvement_threshold: 0.0
+
+init_pos_actuator_gain: 14.0
+init_pos_actuator_bias: 14.0
+init_rot_actuator_gain: 0.14
+init_rot_actuator_bias: 0.14
+guidance_decay_ratio: 0.8
+
+joint_noise_scale: 0.03
+pos_noise_scale: 0.005
+rot_noise_scale: 0.005
+joint_rew_scale: 0.01
+arm_joint_rew_scale: -1.0
+hand_joint_rew_scale: -1.0
+base_pos_rew_scale: 0.0
+base_rot_rew_scale: 0.0
+pos_rew_scale: 1.0
+rot_rew_scale: 0.3
+vel_rew_scale: 0.0001
+terminal_rew_scale: 1.0
+contact_rew_scale: 0.0
+fingertip_rew_scale: 0.0
+object_pos_threshold: 0.15
+object_rot_threshold: 0.5
