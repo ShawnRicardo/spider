@@ -3,12 +3,14 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-export MUJOCO_GL=osmesa
-export PYOPENGL_PLATFORM=osmesa
+export CUDA_VISIBLE_DEVICES=7
+
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
 
 bash examples/asm/generate_scene_asm.sh
 
-env -u LD_LIBRARY_PATH python spider/preprocess/ik.py \
+env -u LD_LIBRARY_PATH python spider/preprocess/ik_PickSpoonBowl.py \
   --dataset-dir example_datasets \
   --dataset-name oakink \
   --robot-type asm \
@@ -20,7 +22,7 @@ env -u LD_LIBRARY_PATH python spider/preprocess/ik.py \
   --save-video \
   --no-show-viewer
 
-env -u LD_LIBRARY_PATH python spider/preprocess/ik.py \
+env -u LD_LIBRARY_PATH python spider/preprocess/ik_PickSpoonBowl.py \
   --dataset-dir example_datasets \
   --dataset-name oakink \
   --robot-type asm \
@@ -30,5 +32,5 @@ env -u LD_LIBRARY_PATH python spider/preprocess/ik.py \
   --open-hand \
   --enable-collision \
   --act-scene \
-  --no-save-video \
+  --save-video \
   --no-show-viewer

@@ -28,7 +28,7 @@ import numpy as np
 import trimesh
 from scipy.spatial.transform import Rotation as R
 
-from spider.io import get_processed_data_dir
+from spider.io import get_mesh_dir, get_processed_data_dir
 from spider.process_datasets import ourdata as ourdata_utils
 
 BBOX_EDGES = [
@@ -105,6 +105,13 @@ class ViewerConfig:
     # 默认关闭，避免 raw/processed 两层 mesh 叠在一起太乱。
     show_processed_object_mesh: bool = False
 
+    # 是否优先显示从 Gaussian PLY 解析出的彩色牛奶盒点云。
+    # 这只影响 debug viewer，不影响 MuJoCo 的 visual.obj / collision。
+    show_colored_object_ply: bool = True
+
+    # 彩色点云显示步长。1 表示显示全部点；更大的值可以降低浏览器负担。
+    colored_object_point_stride: int = 1
+
     # ---------------------------------------------------------------------
     # 服务器与显示尺度参数
     # ---------------------------------------------------------------------
@@ -135,6 +142,8 @@ class RawSceneData:
     object_quats_wxyz: np.ndarray
     object_extents: np.ndarray
     object_mesh: trimesh.Trimesh
+    colored_object_points: np.ndarray | None
+    colored_object_colors: np.ndarray | None
 
 
 @dataclass
@@ -282,6 +291,21 @@ def build_argparser() -> argparse.ArgumentParser:
         help="是否显示 processed 的物体 mesh。默认 false。",
     )
     display_group.add_argument(
+        "--show-colored-object-ply",
+        type=_parse_bool,
+        default=ViewerConfig.show_colored_object_ply,
+        help=(
+            "是否显示从 obj_3d_final.ply 的 Gaussian SH DC 颜色解析出的彩色物体点云。"
+            "默认 true。"
+        ),
+    )
+    display_group.add_argument(
+        "--colored-object-point-stride",
+        type=int,
+        default=ViewerConfig.colored_object_point_stride,
+        help="彩色物体点云显示步长。1 显示全部点，4 表示每 4 个点显示 1 个。",
+    )
+    display_group.add_argument(
         "--point-size-vertices",
         type=float,
         default=ViewerConfig.point_size_vertices,
@@ -354,6 +378,8 @@ def parse_args() -> ViewerConfig:
         show_raw_hand_vertices=args.show_raw_hand_vertices,
         show_raw_object_mesh=args.show_raw_object_mesh,
         show_processed_object_mesh=args.show_processed_object_mesh,
+        show_colored_object_ply=args.show_colored_object_ply,
+        colored_object_point_stride=max(1, args.colored_object_point_stride),
         host=args.host,
         port=args.port,
         point_size_vertices=args.point_size_vertices,
@@ -537,12 +563,56 @@ def load_raw_scene(config: ViewerConfig) -> RawSceneData:
     object_extents = box_data["box_real_size_xyz_m"].astype(np.float32)
 
     object_scale_factor = float(box_data["scale_factor"])
-    object_mesh, _ = ourdata_utils._prepare_object_mesh_for_bbox_frame(
+    object_mesh, mesh_alignment_debug = ourdata_utils._prepare_object_mesh_for_bbox_frame(
         ourdata_utils._load_object_mesh(inputs.object_ply_path),
         scale_factor=object_scale_factor,
         bbox_size_xyz_m=object_extents,
         align_axes_to_bbox=True,
     )
+    colored_object_points = None
+    colored_object_colors = None
+    if config.show_colored_object_ply:
+        try:
+            processed_colored_ply = (
+                Path(
+                    get_mesh_dir(
+                        dataset_dir=str(Path(config.dataset_dir).resolve()),
+                        dataset_name=config.dataset_name,
+                        object_name=config.task,
+                    )
+                )
+                / "visual_colored.ply"
+            )
+            if processed_colored_ply.exists():
+                colored_object_points, colored_object_colors, color_source = (
+                    ourdata_utils._load_gaussian_colored_points(processed_colored_ply)
+                )
+                color_path = processed_colored_ply
+            else:
+                colored_points_raw, colored_colors, color_source = (
+                    ourdata_utils._load_gaussian_colored_points(inputs.object_ply_path)
+                )
+                colored_object_points = (
+                    ourdata_utils._prepare_object_points_with_mesh_alignment(
+                        colored_points_raw,
+                        scale_factor=object_scale_factor,
+                        mesh_alignment_debug=mesh_alignment_debug,
+                    )
+                )
+                colored_object_colors = colored_colors
+                color_path = inputs.object_ply_path
+            loguru.logger.info(
+                "Loaded colored object PLY points from {} (points={}, color_source={})",
+                color_path,
+                len(colored_object_points),
+                color_source,
+            )
+        except Exception as exc:
+            loguru.logger.warning(
+                "Colored object PLY display requested but failed for {}: {}",
+                inputs.object_ply_path,
+                exc,
+            )
 
     return RawSceneData(
         num_frames=num_frames,
@@ -554,6 +624,8 @@ def load_raw_scene(config: ViewerConfig) -> RawSceneData:
         object_quats_wxyz=object_quats_wxyz.astype(np.float32),
         object_extents=object_extents,
         object_mesh=object_mesh,
+        colored_object_points=colored_object_points,
+        colored_object_colors=colored_object_colors,
     )
 
 
@@ -636,6 +708,21 @@ def main(config: ViewerConfig) -> None:
     num_frames = raw.num_frames if processed is None else min(raw.num_frames, processed.num_frames)
 
     raw_mesh = _set_mesh_color(raw.object_mesh, (40, 220, 120, 120))
+    raw_colored_available = (
+        raw.colored_object_points is not None and raw.colored_object_colors is not None
+    )
+    raw_colored_points = None
+    raw_colored_colors = None
+    if raw_colored_available:
+        stride = max(1, int(config.colored_object_point_stride))
+        raw_colored_points = raw.colored_object_points[::stride]
+        raw_colored_colors = raw.colored_object_colors[::stride]
+        loguru.logger.info(
+            "Displaying colored object point cloud with stride={} ({} / {} points)",
+            stride,
+            len(raw_colored_points),
+            len(raw.colored_object_points),
+        )
     processed_mesh = None
     if processed is not None and processed.object_mesh is not None:
         processed_mesh = _set_mesh_color(processed.object_mesh, (255, 160, 0, 120))
@@ -753,8 +840,20 @@ def main(config: ViewerConfig) -> None:
         raw_mesh,
         position=raw.object_centers[0],
         wxyz=raw.object_quats_wxyz[0],
-        visible=config.show_raw_object_mesh,
+        visible=config.show_raw_object_mesh and not raw_colored_available,
     )
+    raw_colored_object_handle = None
+    if raw_colored_points is not None and raw_colored_colors is not None:
+        raw_colored_object_handle = server.scene.add_point_cloud(
+            "/raw/object_colored_ply",
+            raw_colored_points,
+            raw_colored_colors,
+            point_size=config.point_size_vertices,
+            point_shape="circle",
+            position=raw.object_centers[0],
+            wxyz=raw.object_quats_wxyz[0],
+            visible=config.show_colored_object_ply,
+        )
 
     processed_handles: dict[str, object] = {}
     if processed is not None:
@@ -856,7 +955,12 @@ def main(config: ViewerConfig) -> None:
         )
         show_raw_object_mesh = server.gui.add_checkbox(
             "Raw Object Mesh",
-            initial_value=config.show_raw_object_mesh,
+            initial_value=config.show_raw_object_mesh and not raw_colored_available,
+        )
+        show_colored_object_ply = server.gui.add_checkbox(
+            "Raw Colored Object PLY",
+            initial_value=raw_colored_available and config.show_colored_object_ply,
+            disabled=not raw_colored_available,
         )
         show_processed = server.gui.add_checkbox(
             "Processed Overlay",
@@ -907,6 +1011,10 @@ def main(config: ViewerConfig) -> None:
         raw_object_bbox_handle.visible = raw_object_visible
         raw_object_frame_handle.visible = raw_object_visible
         raw_object_mesh_handle.visible = raw_object_visible and show_raw_object_mesh.value
+        if raw_colored_object_handle is not None:
+            raw_colored_object_handle.visible = (
+                raw_object_visible and show_colored_object_ply.value
+            )
 
         if processed is None:
             return
@@ -945,6 +1053,9 @@ def main(config: ViewerConfig) -> None:
         raw_object_frame_handle.wxyz = tuple(raw_quat.tolist())
         raw_object_mesh_handle.position = tuple(raw_center.tolist())
         raw_object_mesh_handle.wxyz = tuple(raw_quat.tolist())
+        if raw_colored_object_handle is not None:
+            raw_colored_object_handle.position = tuple(raw_center.tolist())
+            raw_colored_object_handle.wxyz = tuple(raw_quat.tolist())
 
         if processed is not None:
             proc_idx = min(frame_idx, processed.num_frames - 1)
@@ -991,6 +1102,10 @@ def main(config: ViewerConfig) -> None:
         apply_visibility()
 
     @show_raw_object_mesh.on_update
+    def _(_) -> None:
+        apply_visibility()
+
+    @show_colored_object_ply.on_update
     def _(_) -> None:
         apply_visibility()
 

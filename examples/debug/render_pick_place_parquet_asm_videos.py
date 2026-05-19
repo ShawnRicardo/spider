@@ -11,6 +11,11 @@ This script renders four verification videos:
     kinematic_front.mp4  kinematic_d435.mp4
     dynamic_front.mp4    dynamic_d435.mp4
 
+Use --asm-variant asm_2, asm_3, or asm_4 to generate the robot model from:
+    spider/assets/robots/asm_description/urdf/asm_2.urdf
+    spider/assets/robots/asm_description/urdf/asm_3.urdf
+    spider/assets/robots/asm_description/urdf/asm_4.urdf
+
 Collision can be switched at render-scene generation time:
     urdf_mesh: keep the current active URDF collision meshes
     none:      disable all contacts
@@ -26,6 +31,7 @@ import copy
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -58,6 +64,22 @@ DEFAULT_EPISODE_DIR = REPO_ROOT / "preprocessed/Pick-Place/episode_000001"
 DEFAULT_MODEL_PATH = (
     REPO_ROOT / "example_datasets/processed/ourdata/assets/robots/asm/bimanual.xml"
 )
+ASM_VARIANT_DEFAULT = "asm"
+ASM_VARIANT_ASM_2 = "asm_2"
+ASM_VARIANT_ASM_3 = "asm_3"
+ASM_VARIANT_ASM_4 = "asm_4"
+ASM_VARIANTS = (
+    ASM_VARIANT_DEFAULT,
+    ASM_VARIANT_ASM_2,
+    ASM_VARIANT_ASM_3,
+    ASM_VARIANT_ASM_4,
+)
+ASM_VARIANT_URDFS = {
+    ASM_VARIANT_DEFAULT: REPO_ROOT / "spider/assets/robots/asm_description/urdf/asm.urdf",
+    ASM_VARIANT_ASM_2: REPO_ROOT / "spider/assets/robots/asm_description/urdf/asm_2.urdf",
+    ASM_VARIANT_ASM_3: REPO_ROOT / "spider/assets/robots/asm_description/urdf/asm_3.urdf",
+    ASM_VARIANT_ASM_4: REPO_ROOT / "spider/assets/robots/asm_description/urdf/asm_4.urdf",
+}
 D435_SITE_NAME = "d435_optical_frame"
 COLLISION_MODE_URDF_MESH = "urdf_mesh"
 COLLISION_MODE_NONE = "none"
@@ -98,6 +120,91 @@ FALLBACK_COLOR_HEX = (
 def _resolve_path(path: str | Path) -> Path:
     path = Path(path).expanduser()
     return path if path.is_absolute() else REPO_ROOT / path
+
+
+def _default_output_dir(
+    episode_dir: Path,
+    *,
+    collision_mode: str,
+    asm_variant: str,
+) -> Path:
+    variant_suffix = "" if asm_variant == ASM_VARIANT_DEFAULT else f"_{asm_variant}"
+    if collision_mode == COLLISION_MODE_URDF_MESH:
+        return episode_dir / "verify" if not variant_suffix else episode_dir / "verify" / f"collision_urdf_mesh{variant_suffix}"
+    return episode_dir / "verify" / f"collision_{collision_mode}{variant_suffix}"
+
+
+def _resolve_source_urdf(asm_variant: str, source_urdf: str) -> Path:
+    if source_urdf:
+        return _resolve_path(source_urdf)
+    try:
+        return ASM_VARIANT_URDFS[asm_variant]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported ASM variant: {asm_variant!r}") from exc
+
+
+def _prepare_variant_model(
+    output_dir: Path,
+    *,
+    asm_variant: str,
+    source_urdf: Path,
+    prepare_collision_mesh_scale: float,
+) -> Path:
+    if not source_urdf.is_file():
+        raise FileNotFoundError(f"ASM source URDF not found: {source_urdf}")
+
+    dataset_dir = output_dir / "_generated_robot_dataset"
+    dataset_name = f"pick_place_{asm_variant}"
+    model_path = dataset_dir / "processed" / dataset_name / "assets" / "robots" / "asm" / "bimanual.xml"
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "spider/preprocess/prepare_asm_mjcf.py"),
+        "--dataset-dir",
+        str(dataset_dir),
+        "--dataset-name",
+        dataset_name,
+        "--source-urdf",
+        str(source_urdf),
+        "--robot-type",
+        "asm",
+        "--arm-kp",
+        "800",
+        "--hand-kp",
+        "140",
+        "--arm-damping",
+        "3.0",
+        "--hand-damping",
+        "1.2",
+        "--arm-armature",
+        "0.05",
+        "--hand-armature",
+        "0.02",
+        "--arm-frictionloss",
+        "0.0",
+        "--hand-frictionloss",
+        "0.02",
+        "--arm-force-scale",
+        "8.0",
+        "--hand-force-scale",
+        "8.0",
+        "--collision-mesh-scale",
+        f"{float(prepare_collision_mesh_scale):.9g}",
+        "--collision-geometry-mode",
+        "urdf_mesh",
+        "--variants",
+        "bimanual",
+    ]
+    _log(
+        "Preparing ASM variant model: "
+        f"variant={asm_variant}, source_urdf={source_urdf}, "
+        f"prepare_collision_mesh_scale={prepare_collision_mesh_scale}"
+    )
+    env = os.environ.copy()
+    env.pop("LD_LIBRARY_PATH", None)
+    subprocess.run(cmd, cwd=str(REPO_ROOT), env=env, check=True)
+    if not model_path.is_file():
+        raise FileNotFoundError(f"Prepared ASM model was not created: {model_path}")
+    return model_path
 
 
 def _format_vec(values: np.ndarray) -> str:
@@ -661,6 +768,173 @@ def _body_name(model: mujoco.MjModel, body_id: int) -> str:
 
 def _geom_name(model: mujoco.MjModel, geom_id: int) -> str:
     return mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(geom_id)) or f"geom_{geom_id}"
+
+
+def _set_qpos_zero(data: mujoco.MjData) -> None:
+    model = data.model
+    data.qpos[:] = 0.0
+    data.qvel[:] = 0.0
+    if model.nu:
+        data.ctrl[:] = 0.0
+    for joint_id in range(model.njnt):
+        joint_type = int(model.jnt_type[joint_id])
+        qpos_addr = int(model.jnt_qposadr[joint_id])
+        if joint_type == int(mujoco.mjtJoint.mjJNT_FREE):
+            data.qpos[qpos_addr + 3] = 1.0
+        elif joint_type == int(mujoco.mjtJoint.mjJNT_BALL):
+            data.qpos[qpos_addr] = 1.0
+
+
+def _collect_qpos0_penetrations(
+    model: mujoco.MjModel,
+    *,
+    margin: float,
+) -> dict[str, object]:
+    data = mujoco.MjData(model)
+    _set_qpos_zero(data)
+    try:
+        mujoco.mj_forward(model, data)
+    except mujoco.FatalError as exc:
+        return {
+            "qpos_definition": "all hinge/slide qpos set to 0; free/ball quaternions set to identity",
+            "margin": float(margin),
+            "fatal_error": str(exc),
+            "total_contact_count": None,
+            "penetrating_contact_count": None,
+            "unique_body_pair_count": None,
+            "min_dist": None,
+            "max_penetration": None,
+            "contacts": [],
+            "body_pairs": [],
+        }
+
+    contacts: list[dict[str, object]] = []
+    grouped: dict[tuple[str, str], dict[str, object]] = {}
+    for contact_idx in range(int(data.ncon)):
+        contact = data.contact[contact_idx]
+        dist = float(contact.dist)
+        if dist >= -float(margin):
+            continue
+        geom1 = int(contact.geom1)
+        geom2 = int(contact.geom2)
+        body1 = int(model.geom_bodyid[geom1])
+        body2 = int(model.geom_bodyid[geom2])
+        if body1 == body2:
+            continue
+        body_name1 = _body_name(model, body1)
+        body_name2 = _body_name(model, body2)
+        geom_name1 = _geom_name(model, geom1)
+        geom_name2 = _geom_name(model, geom2)
+        penetration = max(0.0, -dist)
+        contact_entry = {
+            "contact_index": int(contact_idx),
+            "body1": body_name1,
+            "body2": body_name2,
+            "geom1": geom_name1,
+            "geom2": geom_name2,
+            "dist": dist,
+            "penetration": penetration,
+        }
+        contacts.append(contact_entry)
+
+        body_pair = tuple(sorted((body_name1, body_name2)))
+        group = grouped.setdefault(
+            body_pair,
+            {
+                "body1": body_pair[0],
+                "body2": body_pair[1],
+                "min_dist": dist,
+                "max_penetration": penetration,
+                "contact_count": 0,
+                "contacts": [],
+            },
+        )
+        group["min_dist"] = min(float(group["min_dist"]), dist)
+        group["max_penetration"] = max(float(group["max_penetration"]), penetration)
+        group["contact_count"] = int(group["contact_count"]) + 1
+        group_contacts = group["contacts"]
+        assert isinstance(group_contacts, list)
+        group_contacts.append(
+            {
+                "geom1": geom_name1,
+                "geom2": geom_name2,
+                "dist": dist,
+                "penetration": penetration,
+            }
+        )
+
+    contacts.sort(key=lambda item: float(item["dist"]))
+    body_pairs = sorted(grouped.values(), key=lambda item: float(item["min_dist"]))
+    return {
+        "qpos_definition": "all hinge/slide qpos set to 0; free/ball quaternions set to identity",
+        "margin": float(margin),
+        "fatal_error": None,
+        "total_contact_count": int(data.ncon),
+        "penetrating_contact_count": len(contacts),
+        "unique_body_pair_count": len(body_pairs),
+        "min_dist": float(contacts[0]["dist"]) if contacts else None,
+        "max_penetration": float(contacts[0]["penetration"]) if contacts else 0.0,
+        "contacts": contacts,
+        "body_pairs": body_pairs,
+    }
+
+
+def _write_qpos0_penetration_report(
+    output_dir: Path,
+    model: mujoco.MjModel,
+    *,
+    collision_mode: str,
+    asm_variant: str,
+    margin: float,
+) -> tuple[Path, Path, dict[str, object]]:
+    report = _collect_qpos0_penetrations(model, margin=margin)
+    report.update(
+        {
+            "asm_variant": asm_variant,
+            "collision_mode": collision_mode,
+        }
+    )
+    json_path = output_dir / "qpos0_penetration_pairs.json"
+    txt_path = output_dir / "qpos0_penetration_pairs.txt"
+    json_path.write_text(
+        json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    lines = [
+        f"asm_variant: {asm_variant}",
+        f"collision_mode: {collision_mode}",
+        f"qpos_definition: {report['qpos_definition']}",
+        f"margin: {report['margin']}",
+        f"fatal_error: {report['fatal_error']}",
+        f"total_contact_count: {report['total_contact_count']}",
+        f"penetrating_contact_count: {report['penetrating_contact_count']}",
+        f"unique_body_pair_count: {report['unique_body_pair_count']}",
+        f"min_dist: {report['min_dist']}",
+        f"max_penetration: {report['max_penetration']}",
+        "",
+        "body_pairs sorted by min_dist:",
+    ]
+    for pair in report.get("body_pairs", []):
+        if not isinstance(pair, dict):
+            continue
+        lines.append(
+            f"- {pair.get('body1')} <-> {pair.get('body2')}: "
+            f"min_dist={pair.get('min_dist')}, "
+            f"max_penetration={pair.get('max_penetration')}, "
+            f"contact_count={pair.get('contact_count')}"
+        )
+    lines.extend(["", "contacts sorted by dist:"])
+    for contact in report.get("contacts", []):
+        if not isinstance(contact, dict):
+            continue
+        lines.append(
+            f"- {contact.get('geom1')} ({contact.get('body1')}) <-> "
+            f"{contact.get('geom2')} ({contact.get('body2')}): "
+            f"dist={contact.get('dist')}, penetration={contact.get('penetration')}"
+        )
+    txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return json_path, txt_path, report
 
 
 def _ensure_contact_element(root: ET.Element) -> ET.Element:
@@ -1407,6 +1681,11 @@ def _write_summary(
     link_capsule_manifest: Path | None,
     link_collision_manifest: Path | None,
     initial_penetration_exclude_manifest: Path | None,
+    qpos0_penetration_json: Path | None,
+    qpos0_penetration_txt: Path | None,
+    qpos0_penetration_stats: dict[str, object] | None,
+    asm_variant: str,
+    source_urdf_path: Path | None,
 ) -> None:
     first_frame_mapping = {
         "parquet_order": "left_arm(7) + left_hand(20) + right_arm(7) + right_hand(20)",
@@ -1418,6 +1697,8 @@ def _write_summary(
         "episode_dir": str(episode_dir),
         "parquet_path": str(parquet_path),
         "source_model_path": str(source_model_path),
+        "asm_variant": asm_variant,
+        "source_urdf_path": str(source_urdf_path) if source_urdf_path else None,
         "render_scene_path": str(render_scene_path),
         "num_frames": int(len(df)),
         "fps": int(fps),
@@ -1465,6 +1746,11 @@ def _write_summary(
             if initial_penetration_exclude_manifest
             else None
         ),
+        "qpos0_penetration_report": {
+            "json": str(qpos0_penetration_json) if qpos0_penetration_json else None,
+            "txt": str(qpos0_penetration_txt) if qpos0_penetration_txt else None,
+            "stats": qpos0_penetration_stats,
+        },
         "mapping": first_frame_mapping,
     }
     (output_dir / "summary.json").write_text(
@@ -1483,9 +1769,37 @@ def main() -> None:
         help="Episode directory containing timeseries.parquet.",
     )
     parser.add_argument(
+        "--asm-variant",
+        choices=ASM_VARIANTS,
+        default=ASM_VARIANT_DEFAULT,
+        help=(
+            "ASM model variant. asm uses the existing processed bimanual.xml by "
+            "default; asm_2/asm_3/asm_4 generate a temporary MJCF from the matching "
+            "URDF under spider/assets/robots/asm_description/urdf."
+        ),
+    )
+    parser.add_argument(
+        "--source-urdf",
+        default="",
+        help="Optional source URDF override used when generating an ASM variant model.",
+    )
+    parser.add_argument(
         "--model-path",
-        default=str(DEFAULT_MODEL_PATH),
-        help="ASM bimanual MJCF path.",
+        default="",
+        help=(
+            "ASM bimanual MJCF path. If omitted, asm uses the existing processed "
+            "model and asm_2 is generated from --source-urdf."
+        ),
+    )
+    parser.add_argument(
+        "--prepare-collision-mesh-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Collision mesh scale used only while generating the temporary MJCF "
+            "for generated ASM variants. The render-time collision mode can "
+            "still apply its own --urdf-collision-mesh-scale."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -1636,6 +1950,7 @@ def main() -> None:
     _log(f"PYOPENGL_PLATFORM={os.environ.get('PYOPENGL_PLATFORM')}")
     _log(
         "Render options: "
+        f"asm_variant={args.asm_variant}, "
         f"kinematic_front={args.render_kinematic_front}, "
         f"kinematic_head={args.render_kinematic_head}, "
         f"dynamic_front={args.render_dynamic_front}, "
@@ -1658,22 +1973,40 @@ def main() -> None:
     )
     episode_dir = _resolve_path(args.episode_dir)
     parquet_path = episode_dir / "timeseries.parquet"
-    model_path = _resolve_path(args.model_path)
     if args.output_dir:
         output_dir = _resolve_path(args.output_dir)
-    elif args.collision_mode == COLLISION_MODE_URDF_MESH:
-        output_dir = episode_dir / "verify"
     else:
-        output_dir = episode_dir / "verify" / f"collision_{args.collision_mode}"
+        output_dir = _default_output_dir(
+            episode_dir,
+            collision_mode=args.collision_mode,
+            asm_variant=args.asm_variant,
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    source_urdf_path: Path | None = None
+    if args.model_path:
+        model_path = _resolve_path(args.model_path)
+    elif args.asm_variant == ASM_VARIANT_DEFAULT:
+        model_path = DEFAULT_MODEL_PATH
+    else:
+        source_urdf_path = _resolve_source_urdf(args.asm_variant, args.source_urdf)
+        model_path = _prepare_variant_model(
+            output_dir,
+            asm_variant=args.asm_variant,
+            source_urdf=source_urdf_path,
+            prepare_collision_mesh_scale=args.prepare_collision_mesh_scale,
+        )
     _log(f"episode_dir={episode_dir}")
     _log(f"parquet_path={parquet_path}")
+    _log(f"asm_variant={args.asm_variant}")
+    if source_urdf_path is not None:
+        _log(f"source_urdf={source_urdf_path}")
     _log(f"model_path={model_path}")
     _log(f"output_dir={output_dir}")
     if not parquet_path.is_file():
         raise FileNotFoundError(f"Parquet file not found: {parquet_path}")
     if not model_path.is_file():
         raise FileNotFoundError(f"ASM model not found: {model_path}")
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     _log("Loading parquet and remapping joint order...")
     df, qpos_kinematic, ctrl_dynamic = _load_parquet_trajectories(parquet_path)
@@ -1735,6 +2068,26 @@ def main() -> None:
     model = mujoco.MjModel.from_xml_path(str(render_scene_path))
     model.opt.timestep = float(args.sim_dt)
     _log(f"MuJoCo model loaded: nq={model.nq}, nv={model.nv}, nu={model.nu}")
+    qpos0_json, qpos0_txt, qpos0_stats = _write_qpos0_penetration_report(
+        output_dir,
+        model,
+        collision_mode=args.collision_mode,
+        asm_variant=args.asm_variant,
+        margin=args.initial_penetration_exclude_margin,
+    )
+    qpos0_log_stats = {
+        key: qpos0_stats.get(key)
+        for key in (
+            "fatal_error",
+            "total_contact_count",
+            "penetrating_contact_count",
+            "unique_body_pair_count",
+            "min_dist",
+            "max_penetration",
+        )
+    }
+    _log(f"qpos=0 penetration report written: {qpos0_json}, {qpos0_txt}")
+    _log(f"qpos=0 penetration stats: {qpos0_log_stats}")
     _log("Validating parquet-to-ASM joint mapping...")
     _validate_model_mapping(model, qpos_kinematic, ctrl_dynamic)
     _log("Joint mapping validated.")
@@ -1807,6 +2160,8 @@ def main() -> None:
             time=dynamic_time,
             source_parquet=str(parquet_path),
             source_model=str(model_path),
+            asm_variant=str(args.asm_variant),
+            source_urdf=str(source_urdf_path) if source_urdf_path else "",
             collision_mode=str(args.collision_mode),
         )
     else:
@@ -1836,6 +2191,11 @@ def main() -> None:
         link_capsule_manifest=link_capsule_manifest,
         link_collision_manifest=link_collision_manifest,
         initial_penetration_exclude_manifest=initial_penetration_exclude_manifest,
+        qpos0_penetration_json=qpos0_json,
+        qpos0_penetration_txt=qpos0_txt,
+        qpos0_penetration_stats=qpos0_stats,
+        asm_variant=args.asm_variant,
+        source_urdf_path=source_urdf_path,
     )
 
     _log(f"Saved verification videos and metadata to {output_dir}")
@@ -1855,6 +2215,8 @@ def main() -> None:
         _log(f"  {link_collision_manifest}")
     if initial_penetration_exclude_manifest is not None:
         _log(f"  {initial_penetration_exclude_manifest}")
+    _log(f"  {qpos0_json}")
+    _log(f"  {qpos0_txt}")
     _log(f"  {output_dir / 'summary.json'}")
     if render_any_dynamic:
         _log(f"  {output_dir / 'dynamic_rollout.npz'}")

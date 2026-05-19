@@ -287,13 +287,14 @@ def render_image(
     mj_data: mujoco.MjData,
     mj_data_ref: mujoco.MjData,
     include_helpers: bool = True,
+    camera: str | int = "front",
 ):
     options = _make_render_options(include_helpers)
 
     # render sim
     mujoco.mj_forward(mj_model, mj_data)
     try:
-        renderer.update_scene(mj_data, "front", options)
+        renderer.update_scene(mj_data, camera, options)
     except Exception:
         renderer.update_scene(mj_data, 0, options)
     sim_image = renderer.render()
@@ -310,7 +311,7 @@ def render_image(
     # render ref
     mujoco.mj_forward(mj_model, mj_data_ref)
     try:
-        renderer.update_scene(mj_data_ref, "front", options)
+        renderer.update_scene(mj_data_ref, camera, options)
     except Exception:
         renderer.update_scene(mj_data_ref, 0, options)
     ref_image = renderer.render()

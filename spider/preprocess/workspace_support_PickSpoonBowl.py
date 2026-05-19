@@ -22,6 +22,7 @@ class WorkspaceSupportSpec:
     table_surface_z: float
     workspace_z_offset: float
     workspace_xy_offset: np.ndarray
+    workspace_yaw_rad: float
     object_first_frame_min_z: float
     table_center: np.ndarray
     table_size: np.ndarray
@@ -33,6 +34,7 @@ class WorkspaceSupportSpec:
             "table_surface_z": float(self.table_surface_z),
             "workspace_z_offset": float(self.workspace_z_offset),
             "workspace_xy_offset": self.workspace_xy_offset.tolist(),
+            "workspace_yaw_rad": float(self.workspace_yaw_rad),
             "object_first_frame_min_z": float(self.object_first_frame_min_z),
             "support_table_center": self.table_center.tolist(),
             "support_table_size": self.table_size.tolist(),
@@ -238,27 +240,41 @@ def compute_workspace_support_spec(
     xy_center = 0.5 * (object_lower[:2] + object_upper[:2])
     xy_half_extent = 0.5 * (object_upper[:2] - object_lower[:2]) + margin
     workspace_xy_offset = np.zeros(2, dtype=np.float64)
+    workspace_yaw_rad = 0.0
+    table_xy_center = xy_center.copy()
+    table_xy_half_extent = xy_half_extent.copy()
     if use_pick_spoon_bowl_front_workspace:
         # The original OakInk object workspace sits behind/aside the ASM base in
-        # the dataset frame. For ASM bowl/spoon, keep the tabletop on +Y and
-        # center X at 0; the robot asset is rotated in the ASM example script so
-        # its front also faces +Y.
+        # the dataset frame. First recover the +Y workspace used by the normal
+        # ASM path, then rotate that whole workspace by -90 deg around Z. This
+        # preserves the relative table/object/hand layout instead of merely
+        # translating object centers onto the X axis.
         reference_table_center_y = xy_center[1] + ASM_PICK_SPOON_BOWL_REFERENCE_BACK_OFFSET_Y
         mirrored_table_center_y = -reference_table_center_y
         workspace_xy_offset = np.array(
             [-xy_center[0], mirrored_table_center_y - xy_center[1]],
             dtype=np.float64,
         )
+        workspace_yaw_rad = -0.5 * np.pi
+        table_xy_center_y = xy_center + workspace_xy_offset
+        table_xy_center = np.array(
+            [table_xy_center_y[1], -table_xy_center_y[0]],
+            dtype=np.float64,
+        )
+        table_xy_half_extent = np.array(
+            [xy_half_extent[1], xy_half_extent[0]],
+            dtype=np.float64,
+        )
     table_center = np.array(
         [
-            xy_center[0] + workspace_xy_offset[0],
-            xy_center[1] + workspace_xy_offset[1],
+            table_xy_center[0],
+            table_xy_center[1],
             table_surface_z - half_thickness,
         ],
         dtype=np.float64,
     )
     table_size = np.array(
-        [xy_half_extent[0], xy_half_extent[1], half_thickness],
+        [table_xy_half_extent[0], table_xy_half_extent[1], half_thickness],
         dtype=np.float64,
     )
 
@@ -268,6 +284,7 @@ def compute_workspace_support_spec(
             table_surface_z=table_surface_z,
             workspace_z_offset=workspace_z_offset,
             workspace_xy_offset=workspace_xy_offset,
+            workspace_yaw_rad=workspace_yaw_rad,
             object_first_frame_min_z=object_min_z,
             table_center=table_center,
             table_size=table_size,
@@ -298,6 +315,7 @@ def workspace_support_spec_from_task_info(
             task_info.get("workspace_xy_offset", [0.0, 0.0]),
             dtype=np.float64,
         ),
+        workspace_yaw_rad=float(task_info.get("workspace_yaw_rad", 0.0)),
         object_first_frame_min_z=float(task_info["object_first_frame_min_z"]),
         table_center=np.asarray(task_info["support_table_center"], dtype=np.float64),
         table_size=np.asarray(task_info["support_table_size"], dtype=np.float64),

@@ -77,6 +77,7 @@ _CONFIG_SKIP_FIELDS = {
     "env_params_list",
     "viewer_body_entity_and_ids",
 }
+_D435_RENDER_CAMERA_NAME = "d435_optical_render"
 
 _CONSOLE_LOG_STARTED = False
 
@@ -128,6 +129,14 @@ def _start_console_log(config: Config) -> Path:
     atexit.register(_restore)
     print(f"Saving console log to {log_path}", flush=True)
     return log_path
+
+
+def _has_camera(mj_model: mujoco.MjModel, camera_name: str) -> bool:
+    return mujoco.mj_name2id(
+        mj_model,
+        mujoco.mjtObj.mjOBJ_CAMERA,
+        camera_name,
+    ) >= 0
 
 
 def _parse_override_tokens(tokens: list[str]) -> dict:
@@ -628,6 +637,8 @@ def main(config: Config):
     _assert_object_actuator_gains_zero(env, config, "start")
     images = []
     images_clean = []
+    images_d435 = []
+    images_d435_clean = []
     object_trace_site_ids = []
     robot_trace_site_ids = []
     for sid in range(mj_model.nsite):
@@ -762,6 +773,21 @@ def main(config: Config):
     # setup viewer and renderer
     run_viewer = setup_viewer(config, mj_model, mj_data)
     renderer = setup_renderer(config, mj_model)
+    render_d435_video = (
+        config.save_video
+        and renderer is not None
+        and _has_camera(mj_model, _D435_RENDER_CAMERA_NAME)
+    )
+    if config.save_video and renderer is not None and not render_d435_video:
+        loguru.logger.warning(
+            "D435 render camera '{}' not found in model; MJWP D435 videos will not be saved.",
+            _D435_RENDER_CAMERA_NAME,
+        )
+    elif render_d435_video:
+        loguru.logger.info(
+            "MJWP D435 videos will be rendered from camera '{}'.",
+            _D435_RENDER_CAMERA_NAME,
+        )
 
     # setup optimizer
     # 把环境接口（step、save_state、load_state、get_reward 等）打包成一个可以在 1024 个并行环境里跑完整个 horizon的函数。
@@ -1004,6 +1030,27 @@ def main(config: Config):
                         )
                         images.append(image)
                         images_clean.append(image_clean)
+                        if render_d435_video:
+                            image_d435 = render_image(
+                                config,
+                                renderer,
+                                mj_model,
+                                mj_data,
+                                mj_data_ref,
+                                include_helpers=True,
+                                camera=_D435_RENDER_CAMERA_NAME,
+                            )
+                            image_d435_clean = render_image(
+                                config,
+                                renderer,
+                                mj_model,
+                                mj_data,
+                                mj_data_ref,
+                                include_helpers=False,
+                                camera=_D435_RENDER_CAMERA_NAME,
+                            )
+                            images_d435.append(image_d435)
+                            images_d435_clean.append(image_d435_clean)
                 if "rerun" in config.viewer or "viser" in config.viewer:
                     mj_data_ref.qpos[:] = qpos_ref[sim_step + i].detach().cpu().numpy()
                     mujoco.mj_kinematics(mj_model, mj_data_ref)
@@ -1096,6 +1143,22 @@ def main(config: Config):
             fps=int(1 / config.render_dt),
         )
         loguru.logger.info(f"Saved clean video to {video_path_clean}")
+    if config.save_video and len(images_d435) > 0:
+        video_path_d435 = f"{config.output_dir}/visualization_mjwp_d435{'_act' if config.contact_guidance else ''}.mp4"
+        imageio.mimsave(
+            video_path_d435,
+            images_d435,
+            fps=int(1 / config.render_dt),
+        )
+        loguru.logger.info(f"Saved D435 video to {video_path_d435}")
+    if config.save_video and len(images_d435_clean) > 0:
+        video_path_d435_clean = f"{config.output_dir}/visualization_mjwp_d435_clean{'_act' if config.contact_guidance else ''}.mp4"
+        imageio.mimsave(
+            video_path_d435_clean,
+            images_d435_clean,
+            fps=int(1 / config.render_dt),
+        )
+        loguru.logger.info(f"Saved clean D435 video to {video_path_d435_clean}")
 
     # 算成功率指标
     errors = None

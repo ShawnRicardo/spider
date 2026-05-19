@@ -17,7 +17,7 @@ from loop_rate_limiters import RateLimiter
 
 from spider import ROOT
 from spider.io import get_processed_data_dir
-from spider.preprocess.workspace_support import (
+from spider.preprocess.workspace_support_PickSpoonBowl import (
     SUPPORT_TABLE_HALF_THICKNESS,
     SUPPORT_TABLE_MARGIN,
     SUPPORT_TABLE_COLLISION_MODE_OBJECT_AND_HAND,
@@ -62,21 +62,9 @@ def _add_front_camera(
     support_table_spec=None,
 ) -> None:
     if robot_type == "asm":
-        table_center = (
-            np.asarray(support_table_spec.table_center, dtype=np.float64)
-            if support_table_spec is not None
-            else np.zeros(3, dtype=np.float64)
-        )
-        if table_center[1] > 0.0 and abs(table_center[1]) >= abs(table_center[0]):
-            # OakInk bowl/spoon places the workspace on +Y and the ASM root is
-            # rotated to face +Y, so the front render camera should also sit on
-            # +Y looking back toward the robot.
-            pos = [0.0, 3.15, 1.45]
-            target = [0.0, 0.12, 0.72]
-        else:
-            # Camera-aligned scenes such as milk keep ASM front on +X.
-            pos = [3.15, 0.0, 1.45]
-            target = [0.12, 0.0, 0.72]
+        # PickSpoonBowl variant: ASM front, table, objects, and render camera all use +X.
+        pos = [3.15, 0.0, 1.45]
+        target = [0.12, 0.0, 0.72]
         mj_spec.worldbody.add_camera(
             name="front",
             pos=pos,
@@ -128,7 +116,7 @@ def _add_d435_optical_camera(
     site_rot = _quat_to_rotmat(site.quat)
     optical_x = site_rot[:, 0]
     optical_y = site_rot[:, 1]
-    # MuJoCo camera convention uses +X to the right, +Y up, and looks along -Z.
+    # MuJoCo camera convention uses +X right, +Y up, and looks along -Z.
     # D435 optical uses +X right, +Y down, +Z forward.
     body.add_camera(
         name=D435_RENDER_CAMERA_NAME,
@@ -397,8 +385,6 @@ def _bind_groundplane_material_textures(xml_text: str) -> str:
         "groundplane": "groundplane",
         "right_groundplane": "right_groundplane",
         "left_groundplane": "left_groundplane",
-        "right_object_visual_material": "right_object_visual_texture",
-        "left_object_visual_material": "left_object_visual_texture",
     }
     for material in asset.findall("material"):
         name = material.get("name")
@@ -411,26 +397,6 @@ def _bind_groundplane_material_textures(xml_text: str) -> str:
     except AttributeError:
         pass
     return ET.tostring(root, encoding="unicode")
-
-# 选择物体 obj，将物体加入到 xml
-def _select_object_visual_file(
-    mesh_dir: str | None,
-    use_visual_mesh_as_collision: bool,
-) -> tuple[str | None, bool]:
-    if not mesh_dir:
-        return None, False
-    mesh_ply_visual_file = f"{mesh_dir}/visual_mesh.ply"
-    plain_visual_file = f"{mesh_dir}/visual.obj"
-    textured_visual_file = f"{mesh_dir}/visual_textured.obj"
-    if not use_visual_mesh_as_collision and os.path.exists(mesh_ply_visual_file):
-        return mesh_ply_visual_file, False
-    if (
-        not use_visual_mesh_as_collision
-        and os.path.exists(textured_visual_file)
-        and os.path.exists(f"{mesh_dir}/visual_texture.png")
-    ):
-        return textured_visual_file, True
-    return plain_visual_file, False
 
 
 def _add_support_table_pairs(
@@ -590,7 +556,6 @@ def main(
     # Set meshdir relative to where scene.xml will be saved
     original_meshdir = mj_spec.meshdir
     mj_spec.meshdir = assets_root_dir_rel
-    mj_spec.texturedir = assets_root_dir_rel
 
     # Rewrite robot mesh file paths to be relative to the assets directory
     robots_dir_abs = f"{assets_root_dir}/robots/{robot_type}"
@@ -812,71 +777,22 @@ def main(
         )
 
     # Visual meshes (non-colliding)
-    right_visual_file, right_visual_is_textured = _select_object_visual_file(
-        right_mesh_dir,
-        use_visual_mesh_as_collision,
-    )
-    left_visual_file, left_visual_is_textured = _select_object_visual_file(
-        left_mesh_dir,
-        use_visual_mesh_as_collision,
-    )
+    right_visual_file = f"{right_mesh_dir}/visual.obj" if right_mesh_dir else None
+    left_visual_file = f"{left_mesh_dir}/visual.obj" if left_mesh_dir else None
     if (
         embodiment_type in ["right", "bimanual"]
         and right_visual_file
         and os.path.exists(right_visual_file)
     ):
         file_rel_to_meshdir = os.path.relpath(right_visual_file, assets_root_dir)
-        right_mesh_kwargs = {"name": "right_visual", "file": file_rel_to_meshdir}
-        if right_visual_is_textured:
-            right_mesh_kwargs["inertia"] = mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL
-        # 把物体 obj mesh 加入到 xml
-        mj_spec.add_mesh(**right_mesh_kwargs)
-        if right_visual_is_textured and right_mesh_dir:
-            texture_rel = os.path.relpath(
-                f"{right_mesh_dir}/visual_texture.png",
-                assets_root_dir,
-            )
-            mj_spec.add_texture(
-                name="right_object_visual_texture",
-                type=mujoco.mjtTexture.mjTEXTURE_2D,
-                file=texture_rel,
-                colorspace=mujoco.mjtColorSpace.mjCOLORSPACE_SRGB,
-            )
-            mj_spec.add_material(
-                name="right_object_visual_material",
-                textures=["right_object_visual_texture"],
-                rgba=[1.0, 1.0, 1.0, 1.0],
-                specular=0.0,
-                shininess=0.0,
-            )
+        mj_spec.add_mesh(name="right_visual", file=file_rel_to_meshdir)
     if (
         embodiment_type in ["left", "bimanual"]
         and left_visual_file
         and os.path.exists(left_visual_file)
     ):
         file_rel_to_meshdir = os.path.relpath(left_visual_file, assets_root_dir)
-        left_mesh_kwargs = {"name": "left_visual", "file": file_rel_to_meshdir}
-        if left_visual_is_textured:
-            left_mesh_kwargs["inertia"] = mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL
-        mj_spec.add_mesh(**left_mesh_kwargs)
-        if left_visual_is_textured and left_mesh_dir:
-            texture_rel = os.path.relpath(
-                f"{left_mesh_dir}/visual_texture.png",
-                assets_root_dir,
-            )
-            mj_spec.add_texture(
-                name="left_object_visual_texture",
-                type=mujoco.mjtTexture.mjTEXTURE_2D,
-                file=texture_rel,
-                colorspace=mujoco.mjtColorSpace.mjCOLORSPACE_SRGB,
-            )
-            mj_spec.add_material(
-                name="left_object_visual_material",
-                textures=["left_object_visual_texture"],
-                rgba=[1.0, 1.0, 1.0, 1.0],
-                specular=0.0,
-                shininess=0.0,
-            )
+        mj_spec.add_mesh(name="left_visual", file=file_rel_to_meshdir)
 
     # Right object meshes
     right_object_files = []
@@ -937,7 +853,7 @@ def main(
                 and not object_bbox_collision
             )
             if use_mesh_for_contact:
-                rgba = [0, 1, 0, 0]
+                rgba = [0, 1, 0, 1]
                 density = object_density
                 if is_visual_collision:
                     geom_name = "right_object_collision_visual"
@@ -947,7 +863,7 @@ def main(
                 # With bbox collision enabled, keep mesh geoms for mass/inertia
                 # only. Otherwise mesh contacts plus bbox contacts double-count
                 # impulses and can launch the object during MJWP rollouts.
-                rgba = [0, 1, 0, 0]
+                rgba = [0, 1, 0, 0.25]
                 density = object_density
                 group = 3
             else:
@@ -980,7 +896,7 @@ def main(
                     type=mujoco.mjtGeom.mjGEOM_BOX,
                     pos=[0, 0, 0],
                     size=bbox_half_extents,
-                    rgba=[0.0, 0.8, 0.0, 0.0],
+                    rgba=[0.0, 0.8, 0.0, 0.18],
                     density=0,
                     group=3,
                     **_object_contact_attrs(use_default_collision_contacts),
@@ -996,20 +912,17 @@ def main(
         )
         # add visual mesh (non-colliding)
         if "right_visual" in [m.name for m in mj_spec.meshes]:
-            right_visual_geom_kwargs = {
-                "name": "right_object_visual",
-                "type": mujoco.mjtGeom.mjGEOM_MESH,
-                "meshname": "right_visual",
-                "pos": [0, 0, 0],
-                "conaffinity": 0,
-                "contype": 0,
-                "rgba": [1, 1, 1, 1],
-                "density": 0,
-                "group": 0,
-            }
-            if right_visual_is_textured:
-                right_visual_geom_kwargs["material"] = "right_object_visual_material"
-            right_object_handle.add_geom(**right_visual_geom_kwargs)
+            right_object_handle.add_geom(
+                name="right_object_visual",
+                type=mujoco.mjtGeom.mjGEOM_MESH,
+                meshname="right_visual",
+                pos=[0, 0, 0],
+                conaffinity=0,
+                contype=0,
+                rgba=[1, 1, 1, 1],
+                density=0,
+                group=0,
+            )
         # add trace site to the object (for visualization)
         right_object_handle.add_site(
             name="trace_right_object",
@@ -1080,14 +993,14 @@ def main(
                 and not object_bbox_collision
             )
             if use_mesh_for_contact:
-                rgba = [0, 1, 0, 0]
+                rgba = [0, 1, 0, 1]
                 density = object_density
                 if is_visual_collision:
                     geom_name = "left_object_collision_visual"
                 left_object_collision_names.append(geom_name)
                 group = 3
             elif suffix.isdigit() or is_visual_collision:
-                rgba = [0, 1, 0, 0]
+                rgba = [0, 1, 0, 0.25]
                 density = object_density
                 group = 3
             else:
@@ -1120,7 +1033,7 @@ def main(
                     type=mujoco.mjtGeom.mjGEOM_BOX,
                     pos=[0, 0, 0],
                     size=bbox_half_extents,
-                    rgba=[0.0, 0.8, 0.0, 0.0],
+                    rgba=[0.0, 0.8, 0.0, 0.18],
                     density=0,
                     group=3,
                     **_object_contact_attrs(use_default_collision_contacts),
@@ -1133,7 +1046,6 @@ def main(
                 pos=[0.5, 0.5, 0.5],  # put it far away to avoid collision
                 size=[0.1, 0.1, 0.1],
                 density=10,
-                rgba=[0.0, 0.0, 0.0, 0.0],
                 group=3,
             )
             left_joint_handle.frictionloss = 1.0
@@ -1149,20 +1061,17 @@ def main(
         )
         # add visual mesh (non-colliding)
         if "left_visual" in [m.name for m in mj_spec.meshes]:
-            left_visual_geom_kwargs = {
-                "name": "left_object_visual",
-                "type": mujoco.mjtGeom.mjGEOM_MESH,
-                "meshname": "left_visual",
-                "pos": [0, 0, 0],
-                "conaffinity": 0,
-                "contype": 0,
-                "rgba": [1, 1, 1, 1],
-                "density": 0,
-                "group": 0,
-            }
-            if left_visual_is_textured:
-                left_visual_geom_kwargs["material"] = "left_object_visual_material"
-            left_object_handle.add_geom(**left_visual_geom_kwargs)
+            left_object_handle.add_geom(
+                name="left_object_visual",
+                type=mujoco.mjtGeom.mjGEOM_MESH,
+                meshname="left_visual",
+                pos=[0, 0, 0],
+                conaffinity=0,
+                contype=0,
+                rgba=[1, 1, 1, 1],
+                density=0,
+                group=0,
+            )
         # add trace site to the object
         left_object_handle.add_site(
             name="trace_left_object",

@@ -416,21 +416,27 @@ def _bind_groundplane_material_textures(xml_text: str) -> str:
 def _select_object_visual_file(
     mesh_dir: str | None,
     use_visual_mesh_as_collision: bool,
-) -> tuple[str | None, bool]:
+) -> tuple[str | None, str | None, bool]:
     if not mesh_dir:
-        return None, False
-    mesh_ply_visual_file = f"{mesh_dir}/visual_mesh.ply"
+        return None, None, False
     plain_visual_file = f"{mesh_dir}/visual.obj"
+    mesh_textured_visual_file = f"{mesh_dir}/visual_mesh_textured.obj"
+    mesh_texture_file = f"{mesh_dir}/visual_mesh_texture.png"
     textured_visual_file = f"{mesh_dir}/visual_textured.obj"
-    if not use_visual_mesh_as_collision and os.path.exists(mesh_ply_visual_file):
-        return mesh_ply_visual_file, False
+    texture_file = f"{mesh_dir}/visual_texture.png"
+    if (
+        not use_visual_mesh_as_collision
+        and os.path.exists(mesh_textured_visual_file)
+        and os.path.exists(mesh_texture_file)
+    ):
+        return mesh_textured_visual_file, mesh_texture_file, True
     if (
         not use_visual_mesh_as_collision
         and os.path.exists(textured_visual_file)
-        and os.path.exists(f"{mesh_dir}/visual_texture.png")
+        and os.path.exists(texture_file)
     ):
-        return textured_visual_file, True
-    return plain_visual_file, False
+        return textured_visual_file, texture_file, True
+    return plain_visual_file, None, False
 
 
 def _add_support_table_pairs(
@@ -812,11 +818,11 @@ def main(
         )
 
     # Visual meshes (non-colliding)
-    right_visual_file, right_visual_is_textured = _select_object_visual_file(
+    right_visual_file, right_visual_texture_file, right_visual_is_textured = _select_object_visual_file(
         right_mesh_dir,
         use_visual_mesh_as_collision,
     )
-    left_visual_file, left_visual_is_textured = _select_object_visual_file(
+    left_visual_file, left_visual_texture_file, left_visual_is_textured = _select_object_visual_file(
         left_mesh_dir,
         use_visual_mesh_as_collision,
     )
@@ -831,9 +837,9 @@ def main(
             right_mesh_kwargs["inertia"] = mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL
         # 把物体 obj mesh 加入到 xml
         mj_spec.add_mesh(**right_mesh_kwargs)
-        if right_visual_is_textured and right_mesh_dir:
+        if right_visual_is_textured and right_visual_texture_file:
             texture_rel = os.path.relpath(
-                f"{right_mesh_dir}/visual_texture.png",
+                right_visual_texture_file,
                 assets_root_dir,
             )
             mj_spec.add_texture(
@@ -859,9 +865,9 @@ def main(
         if left_visual_is_textured:
             left_mesh_kwargs["inertia"] = mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL
         mj_spec.add_mesh(**left_mesh_kwargs)
-        if left_visual_is_textured and left_mesh_dir:
+        if left_visual_is_textured and left_visual_texture_file:
             texture_rel = os.path.relpath(
-                f"{left_mesh_dir}/visual_texture.png",
+                left_visual_texture_file,
                 assets_root_dir,
             )
             mj_spec.add_texture(

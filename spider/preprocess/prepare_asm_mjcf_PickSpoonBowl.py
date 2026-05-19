@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import json
 import math
 import re
 import shutil
@@ -59,50 +58,6 @@ URDF_COLLISION_PREFIXES = ("collision_hand_", "collision_arm_", "collision_body_
 ASM_FINGER_TO_NAME = {value: key for key, value in FINGER_MAP.items()}
 COLLISION_GEOMETRY_MODES = ("primitive", "urdf_mesh")
 DEFAULT_COLLISION_GEOMETRY_MODE = "primitive"
-COLLISION_COLOR_ALPHA = 0.45
-COLLISION_COLOR_HEX = {
-    "Link_1": "#e6194b",
-    "Link_2": "#3cb44b",
-    "Link_3": "#ffe119",
-    "Link_4": "#4363d8",
-    "Link_5": "#f58231",
-    "Link_6": "#911eb4",
-    "Link_7": "#46f0f0",
-    "Palm": "#f032e6",
-    "thumb_link1": "#bcf60c",
-    "thumb_link2": "#fabebe",
-    "thumb_link3": "#008080",
-    "thumb_tip_link": "#e6beff",
-    "index_link1": "#9a6324",
-    "index_link2": "#fffac8",
-    "index_link3": "#800000",
-    "index_tip_link": "#aaffc3",
-    "middle_link1": "#808000",
-    "middle_link2": "#ffd8b1",
-    "middle_link3": "#000075",
-    "middle_tip_link": "#808080",
-    "ring_link1": "#ff6f69",
-    "ring_link2": "#88d8b0",
-    "ring_link3": "#ffcc5c",
-    "ring_tip_link": "#6b5b95",
-    "pinky_link1": "#2a9d8f",
-    "pinky_link2": "#e76f51",
-    "pinky_link3": "#264653",
-    "pinky_tip_link": "#f4a261",
-    "Body_head": "#8ecae6",
-    "Body_camera": "#219ebc",
-    "Body_other": "#adb5bd",
-}
-FALLBACK_COLOR_HEX = (
-    "#ff595e",
-    "#ffca3a",
-    "#8ac926",
-    "#1982c4",
-    "#6a4c93",
-    "#00bbf9",
-    "#00f5d4",
-    "#f15bb5",
-)
 
 
 def parse_args() -> argparse.Namespace:
@@ -540,83 +495,6 @@ def _collision_name_base(body_name: str, mesh_name: str) -> str:
     return f"collision_body_{_sanitize_name(body_name)}_{_sanitize_name(mesh_name)}"
 
 
-def _hex_to_rgba_values(color_hex: str, alpha: float = COLLISION_COLOR_ALPHA) -> list[float]:
-    value = color_hex.strip().lstrip("#")
-    if len(value) != 6:
-        raise ValueError(f"Expected 6-digit hex color, got {color_hex!r}")
-    return [
-        int(value[0:2], 16) / 255.0,
-        int(value[2:4], 16) / 255.0,
-        int(value[4:6], 16) / 255.0,
-        float(alpha),
-    ]
-
-
-def _rgba_string(values: list[float]) -> str:
-    return " ".join(fmt(float(value)) for value in values)
-
-
-def _fallback_color_hex(key: str) -> str:
-    idx = sum((i + 1) * ord(ch) for i, ch in enumerate(key)) % len(FALLBACK_COLOR_HEX)
-    return FALLBACK_COLOR_HEX[idx]
-
-
-def _collision_proxy_metadata(geom_name: str, mesh_name: str = "") -> dict[str, object]:
-    side = "none"
-    if "_left_" in geom_name:
-        side = "left"
-    elif "_right_" in geom_name:
-        side = "right"
-
-    component = "other"
-    link_key = mesh_name or geom_name
-    link_label = link_key
-
-    arm_match = re.search(r"collision_arm_(left|right)_link([0-9]+)", geom_name)
-    if arm_match:
-        side = arm_match.group(1)
-        component = "arm"
-        link_key = f"Link_{arm_match.group(2)}"
-        link_label = link_key
-    elif re.search(r"collision_hand_(left|right)_palm", geom_name):
-        component = "hand"
-        link_key = "Palm"
-        link_label = "Palm"
-    else:
-        finger_match = re.search(
-            r"collision_hand_(left|right)_(thumb|index|middle|ring|pinky)_(link[0-9]+|tip_link)",
-            geom_name,
-        )
-        if finger_match:
-            side = finger_match.group(1)
-            component = "hand"
-            link_key = f"{finger_match.group(2)}_{finger_match.group(3)}"
-            link_label = link_key
-        elif geom_name.startswith("collision_body_"):
-            component = "body"
-            if "d435" in geom_name or "camera" in geom_name:
-                link_key = "Body_camera"
-                link_label = "Camera"
-            elif "head" in geom_name:
-                link_key = "Body_head"
-                link_label = "Head"
-            else:
-                link_key = "Body_other"
-                link_label = mesh_name or geom_name.replace("collision_body_", "Body_")
-
-    color_hex = COLLISION_COLOR_HEX.get(link_key, _fallback_color_hex(link_key))
-    rgba_values = _hex_to_rgba_values(color_hex)
-    return {
-        "component": component,
-        "side": side,
-        "link_key": link_key,
-        "link_label": link_label,
-        "color_hex": color_hex,
-        "rgba": rgba_values,
-        "rgba_string": _rgba_string(rgba_values),
-    }
-
-
 def activate_urdf_collision_meshes(root: ET.Element) -> None:
     """Name URDF collision meshes as active collision candidates.
 
@@ -644,10 +522,7 @@ def activate_urdf_collision_meshes(root: ET.Element) -> None:
                 geom.set("condim", geom.get("condim", "3"))
                 geom.set("density", "0")
                 geom.set("group", "3")
-                geom.set(
-                    "rgba",
-                    str(_collision_proxy_metadata(geom.get("name", ""), mesh_name)["rgba_string"]),
-                )
+                geom.set("rgba", geom.get("rgba", "0 0.8 1 0.28"))
                 collision_count += 1
             else:
                 geom.set("contype", "0")
@@ -1286,61 +1161,6 @@ def write_xml(root: ET.Element, path: Path) -> None:
     ET.ElementTree(root).write(path, encoding="unicode")
 
 
-def _parse_rgba_string(value: str | None, fallback: list[float]) -> list[float]:
-    if not value:
-        return list(fallback)
-    try:
-        parts = [float(part) for part in value.split()]
-    except ValueError:
-        return list(fallback)
-    if len(parts) == 3:
-        parts.append(1.0)
-    if len(parts) != 4:
-        return list(fallback)
-    return parts
-
-
-def write_collision_proxy_color_manifest(
-    root: ET.Element,
-    path: Path,
-    *,
-    collision_mode: str,
-    collision_mesh_scale: float,
-    source_urdf: Path,
-) -> None:
-    entries: list[dict[str, object]] = []
-    for geom in root.iter("geom"):
-        geom_name = geom.get("name", "")
-        if not geom_name.startswith(URDF_COLLISION_PREFIXES):
-            continue
-        mesh_name = geom.get("mesh", "")
-        metadata = _collision_proxy_metadata(geom_name, mesh_name)
-        fallback_rgba = list(metadata["rgba"])  # type: ignore[arg-type]
-        entries.append(
-            {
-                "geom_name": geom_name,
-                "geom_type": geom.get("type", "mesh" if mesh_name else "unknown"),
-                "mesh_name": mesh_name,
-                "component": metadata["component"],
-                "side": metadata["side"],
-                "link_key": metadata["link_key"],
-                "link_label": metadata["link_label"],
-                "color_hex": metadata["color_hex"],
-                "rgba": _parse_rgba_string(geom.get("rgba"), fallback_rgba),
-            }
-        )
-
-    payload = {
-        "collision_mode": collision_mode,
-        "collision_mesh_scale": float(collision_mesh_scale),
-        "source_urdf": str(source_urdf),
-        "num_entries": len(entries),
-        "entries": entries,
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
 def main() -> None:
     args = parse_args()
     dataset_dir = Path(args.dataset_dir).resolve()
@@ -1405,14 +1225,6 @@ def main() -> None:
         hand_force_scale=args.hand_force_scale,
     )
     add_position_actuators(root, args.arm_kp, args.hand_kp)
-    manifest_path = output_dir / "collision_proxy_colors.json"
-    write_collision_proxy_color_manifest(
-        root,
-        manifest_path,
-        collision_mode=args.collision_geometry_mode,
-        collision_mesh_scale=args.collision_mesh_scale,
-        source_urdf=source_urdf,
-    )
 
     for variant in args.variants:
         variant_root = prune_variant(root, variant)
@@ -1421,7 +1233,6 @@ def main() -> None:
         write_xml(variant_root, xml_path)
         validate_model(xml_path, variant)
 
-    print(f"Saved ASM collision color manifest to {manifest_path}")
     print(f"Saved ASM robot assets to {output_dir}")
 
 

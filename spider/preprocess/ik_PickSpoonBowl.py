@@ -33,7 +33,7 @@ from scipy import signal
 from spider import ROOT
 from spider.io import get_processed_data_dir
 from spider.mujoco_utils import get_viewer
-from spider.preprocess.workspace_support import (
+from spider.preprocess.workspace_support_PickSpoonBowl import (
     compute_workspace_support_spec,
     workspace_support_spec_from_task_info,
 )
@@ -62,6 +62,60 @@ def _normalize_quat(quat: np.ndarray) -> np.ndarray:
     if norm < 1e-8:
         return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
     return quat / norm
+
+
+def _yaw_quat_wxyz(yaw_rad: float) -> np.ndarray:
+    half_yaw = 0.5 * float(yaw_rad)
+    return np.array(
+        [np.cos(half_yaw), 0.0, 0.0, np.sin(half_yaw)],
+        dtype=np.float64,
+    )
+
+
+def _quat_multiply_wxyz(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    left = np.asarray(left, dtype=np.float64)
+    right = np.asarray(right, dtype=np.float64)
+    w1, x1, y1, z1 = np.moveaxis(left, -1, 0)
+    w2, x2, y2, z2 = np.moveaxis(right, -1, 0)
+    out = np.stack(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        axis=-1,
+    )
+    norm = np.linalg.norm(out, axis=-1, keepdims=True)
+    return out / np.maximum(norm, 1e-12)
+
+
+def _apply_workspace_xy_transform(
+    points: np.ndarray,
+    workspace_xy_offset: np.ndarray,
+    workspace_yaw_rad: float,
+) -> None:
+    points[..., :2] += workspace_xy_offset
+    if abs(workspace_yaw_rad) <= 1e-9:
+        return
+    c = float(np.cos(workspace_yaw_rad))
+    s = float(np.sin(workspace_yaw_rad))
+    x = points[..., 0].copy()
+    y = points[..., 1].copy()
+    points[..., 0] = c * x - s * y
+    points[..., 1] = s * x + c * y
+
+
+def _apply_workspace_qpos_transform(
+    qpos: np.ndarray,
+    workspace_xy_offset: np.ndarray,
+    workspace_yaw_rad: float,
+) -> None:
+    _apply_workspace_xy_transform(qpos[..., :3], workspace_xy_offset, workspace_yaw_rad)
+    if abs(workspace_yaw_rad) <= 1e-9:
+        return
+    yaw_quat = _yaw_quat_wxyz(workspace_yaw_rad)
+    qpos[..., 3:7] = _quat_multiply_wxyz(yaw_quat, qpos[..., 3:7])
 
 
 def _site_rgba_from_name(site_name: str, is_object_target: bool) -> list[float]:
@@ -289,6 +343,13 @@ def _uses_camera_world_alignment(task_info: dict) -> bool:
     return task_info.get("world_to_sim_alignment_mode") == "d435_optical"
 
 
+def _has_camera(model: mujoco.MjModel, camera_name: str) -> bool:
+    return (
+        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
+        != -1
+    )
+
+
 def _set_debug_body_pose(
     data: mujoco.MjData,
     mocap_id: int,
@@ -321,13 +382,6 @@ def _geom_name(model: mujoco.MjModel, geom_id: int) -> str:
     return name or f"geom_{int(geom_id)}"
 
 
-def _has_camera(model: mujoco.MjModel, camera_name: str) -> bool:
-    return (
-        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
-        != -1
-    )
-
-
 def _contact_category(geom_name: str) -> str:
     if geom_name == "floor":
         return "floor"
@@ -357,34 +411,6 @@ def _make_collision_debug_scene_option() -> mujoco.MjvOption:
     opt.geomgroup[3] = True
     for group_idx in range(len(opt.sitegroup)):
         opt.sitegroup[group_idx] = False
-    return opt
-
-
-def _make_visual_scene_option(
-    *,
-    visualize_hand_keypoints: bool,
-    visualize_object_bbox: bool,
-    visualize_object_axes: bool,
-    visualize_world_axes: bool,
-    visualize_robot_base_axes: bool,
-    visualize_head_camera_axes: bool,
-) -> mujoco.MjvOption:
-    opt = mujoco.MjvOption()
-    mujoco.mjv_defaultOption(opt)
-    # Collision geoms live in group 3. They remain active in the model for
-    # physics, but normal IK/D435 videos should show the textured visual object
-    # instead of green convex/bbox collision helpers.
-    opt.geomgroup[3] = False
-    if visualize_hand_keypoints:
-        opt.sitegroup[4] = True
-    if (
-        visualize_object_bbox
-        or visualize_object_axes
-        or visualize_world_axes
-        or visualize_robot_base_axes
-        or visualize_head_camera_axes
-    ):
-        opt.geomgroup[DEBUG_GEOM_GROUP] = True
     return opt
 
 
@@ -1130,6 +1156,7 @@ def main(
 
     workspace_z_offset = float(z_offset)
     workspace_xy_offset = np.zeros(2, dtype=np.float64)
+    workspace_yaw_rad = 0.0
     support_task_info_path = f"{processed_dir_robot}/../task_info.json"
     support_spec = None
     mano_task_info_path = f"{processed_dir_mano}/../task_info.json"
@@ -1172,13 +1199,15 @@ def main(
             )
         workspace_z_offset = support_spec.workspace_z_offset
         workspace_xy_offset = support_spec.workspace_xy_offset.copy()
+        workspace_yaw_rad = float(getattr(support_spec, "workspace_yaw_rad", 0.0))
         loguru.logger.info(
-            "ASM workspace support: robot_height={:.4f}, table_surface_z={:.4f}, object_first_frame_min_z={:.4f}, workspace_z_offset={:.4f}, workspace_xy_offset={}",
+            "ASM workspace support: robot_height={:.4f}, table_surface_z={:.4f}, object_first_frame_min_z={:.4f}, workspace_z_offset={:.4f}, workspace_xy_offset={}, workspace_yaw_rad={:.4f}",
             support_spec.robot_height,
             support_spec.table_surface_z,
             support_spec.object_first_frame_min_z,
             support_spec.workspace_z_offset,
             support_spec.workspace_xy_offset.tolist(),
+            workspace_yaw_rad,
         )
     if abs(z_offset) > 1e-9 and support_spec is not None:
         workspace_z_offset += float(z_offset)
@@ -1194,16 +1223,41 @@ def main(
     qpos_wrist_left = qpos_wrist_left_raw.copy()
     qpos_obj_right = qpos_obj_right_raw.copy()
     qpos_obj_left = qpos_obj_left_raw.copy()
-    if np.linalg.norm(workspace_xy_offset) > 1e-9:
-        qpos_finger_right[:, :, :2] += workspace_xy_offset
-        qpos_finger_left[:, :, :2] += workspace_xy_offset
-        qpos_wrist_right[:, :2] += workspace_xy_offset
-        qpos_wrist_left[:, :2] += workspace_xy_offset
-        qpos_obj_right[:, :2] += workspace_xy_offset
-        qpos_obj_left[:, :2] += workspace_xy_offset
+    if np.linalg.norm(workspace_xy_offset) > 1e-9 or abs(workspace_yaw_rad) > 1e-9:
+        _apply_workspace_xy_transform(
+            qpos_finger_right,
+            workspace_xy_offset,
+            workspace_yaw_rad,
+        )
+        _apply_workspace_xy_transform(
+            qpos_finger_left,
+            workspace_xy_offset,
+            workspace_yaw_rad,
+        )
+        _apply_workspace_qpos_transform(
+            qpos_wrist_right,
+            workspace_xy_offset,
+            workspace_yaw_rad,
+        )
+        _apply_workspace_qpos_transform(
+            qpos_wrist_left,
+            workspace_xy_offset,
+            workspace_yaw_rad,
+        )
+        _apply_workspace_qpos_transform(
+            qpos_obj_right,
+            workspace_xy_offset,
+            workspace_yaw_rad,
+        )
+        _apply_workspace_qpos_transform(
+            qpos_obj_left,
+            workspace_xy_offset,
+            workspace_yaw_rad,
+        )
         loguru.logger.info(
-            "Applied workspace_xy_offset={}; wrist_xy [{:.4f}, {:.4f}] -> [{:.4f}, {:.4f}]",
+            "Applied workspace transform: xy_offset={}, yaw_rad={:.4f}; wrist_xy [{:.4f}, {:.4f}] -> [{:.4f}, {:.4f}]",
             workspace_xy_offset.tolist(),
+            workspace_yaw_rad,
             float(qpos_wrist_right_raw[:, 0].mean()),
             float(qpos_wrist_right_raw[:, 1].mean()),
             float(qpos_wrist_right[:, 0].mean()),
@@ -1740,7 +1794,6 @@ def main(
 
     with run_viewer() as gui:
         if use_mujoco_viewer and hasattr(gui, "opt"):
-            gui.opt.geomgroup[3] = False
             if visualize_hand_keypoints:
                 gui.opt.sitegroup[4] = True
             if (
@@ -1961,14 +2014,18 @@ def main(
 
             qpos_list.append(mj_data.qpos.copy())
             if save_video:
-                opt = _make_visual_scene_option(
-                    visualize_hand_keypoints=visualize_hand_keypoints,
-                    visualize_object_bbox=visualize_object_bbox,
-                    visualize_object_axes=visualize_object_axes,
-                    visualize_world_axes=visualize_world_axes,
-                    visualize_robot_base_axes=visualize_robot_base_axes,
-                    visualize_head_camera_axes=visualize_head_camera_axes,
-                )
+                opt = mujoco.MjvOption()
+                mujoco.mjv_defaultOption(opt)
+                if visualize_hand_keypoints:
+                    opt.sitegroup[4] = True
+                if (
+                    visualize_object_bbox
+                    or visualize_object_axes
+                    or visualize_world_axes
+                    or visualize_robot_base_axes
+                    or visualize_head_camera_axes
+                ):
+                    opt.geomgroup[DEBUG_GEOM_GROUP] = True
                 if use_debug_render:
                     _sync_debug_visualization_state(
                         model=mj_model_ik,
@@ -2148,14 +2205,18 @@ def main(
                 return
             import imageio
 
-            opt = _make_visual_scene_option(
-                visualize_hand_keypoints=visualize_hand_keypoints,
-                visualize_object_bbox=visualize_object_bbox,
-                visualize_object_axes=visualize_object_axes,
-                visualize_world_axes=visualize_world_axes,
-                visualize_robot_base_axes=visualize_robot_base_axes,
-                visualize_head_camera_axes=visualize_head_camera_axes,
-            )
+            opt = mujoco.MjvOption()
+            mujoco.mjv_defaultOption(opt)
+            if visualize_hand_keypoints:
+                opt.sitegroup[4] = True
+            if (
+                visualize_object_bbox
+                or visualize_object_axes
+                or visualize_world_axes
+                or visualize_robot_base_axes
+                or visualize_head_camera_axes
+            ):
+                opt.geomgroup[DEBUG_GEOM_GROUP] = True
 
             ref_frame_indices = np.clip(
                 np.arange(qpos_trajectory.shape[0]) + 1 + average_frame_size // 2,

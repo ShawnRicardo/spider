@@ -9,10 +9,10 @@ export CUDA_VISIBLE_DEVICES=7
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
 
-HOST="${1:-0.0.0.0}"
+HOST="${1:-127.0.0.1}"
 PORT="${2:-8080}"
 
-bash examples/asm_ourdata/generate_scene_ourdata_milk_asm_PickSpoonBowlParams.sh
+bash examples/asm_ourdata/generate_scene_ourdata_milk_asm_NewCollision.sh
 
 env -u LD_LIBRARY_PATH python spider/preprocess/ik.py \
     --dataset-dir example_datasets \

@@ -66,7 +66,7 @@ env -u LD_LIBRARY_PATH python spider/preprocess/generate_xml.py \
   --object-bbox-collision \
   --object-bbox-collision-margin 0.001 \
   --support-table-from-bbox \
-  --support-table-collision-mode object_and_manipulator \
+  --support-table-collision-mode object_only \
   --support-table-height-mode first_frame_min \
   --support-table-z-offset=0.0 \
   --no-show-viewer
@@ -85,7 +85,7 @@ env -u LD_LIBRARY_PATH python spider/preprocess/generate_xml.py \
   --object-bbox-collision \
   --object-bbox-collision-margin 0.001 \
   --support-table-from-bbox \
-  --support-table-collision-mode object_and_manipulator \
+  --support-table-collision-mode object_only \
   --support-table-height-mode first_frame_min \
   --support-table-z-offset=0.0 \
   --act-scene \

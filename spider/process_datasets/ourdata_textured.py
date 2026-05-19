@@ -642,12 +642,14 @@ def _resolve_workspace_inputs(workspace_path: Path, object_id: str) -> Workspace
     )
     object_ply_path = _first_existing(
         [
+            workspace_path / "sam3d" / object_id / "obj_mesh_final.obj",
             workspace_path / "sam3d" / object_id / "obj_mesh_final.ply",
             workspace_path / "sam3d" / object_id / "obj_3d_final.ply",
+            workspace_path / "sam3d" / "obj_mesh_final.obj",
             workspace_path / "sam3d" / "obj_mesh_final.ply",
             workspace_path / "sam3d" / "obj_3d_final.ply",
         ],
-        "obj_mesh_final.ply or obj_3d_final.ply",
+        "obj_mesh_final.obj, obj_mesh_final.ply, or obj_3d_final.ply",
     )
     masks_candidates = [
         workspace_path / "masks" / "objects_full",
@@ -742,7 +744,7 @@ def _load_foundationpose_object_trajectory(
 
 
 def _load_object_mesh(source_ply: Path) -> trimesh.Trimesh:
-    geometry = trimesh.load(source_ply, process=False)
+    geometry = trimesh.load(source_ply, process=False, maintain_order=True)
     if isinstance(geometry, trimesh.Scene):
         geometry = trimesh.util.concatenate(tuple(geometry.geometry.values()))
     if isinstance(geometry, trimesh.points.PointCloud):
@@ -756,6 +758,18 @@ def _load_object_mesh(source_ply: Path) -> trimesh.Trimesh:
     if mesh.is_empty:
         raise RuntimeError(f"failed to build a mesh from {source_ply}")
     return mesh
+
+
+def _source_mesh_has_faces(source_mesh: Path) -> bool:
+    if source_mesh.suffix.lower() == ".ply":
+        return _ply_has_faces(source_mesh)
+    geometry = trimesh.load(source_mesh, process=False, maintain_order=True)
+    if isinstance(geometry, trimesh.Scene):
+        return any(
+            isinstance(part, trimesh.Trimesh) and len(part.faces) > 0
+            for part in geometry.geometry.values()
+        )
+    return isinstance(geometry, trimesh.Trimesh) and len(geometry.faces) > 0
 
 
 def _ply_has_faces(source_ply: Path) -> bool:
@@ -1185,6 +1199,177 @@ def _bake_textured_box_assets(
     return obj_path, mtl_path, texture_path, (int(atlas.shape[1]), int(atlas.shape[0]))
 
 
+def _extract_mesh_vertex_rgb(mesh: trimesh.Trimesh) -> np.ndarray | None:
+    vertex_colors = getattr(mesh.visual, "vertex_colors", None)
+    if vertex_colors is None or len(vertex_colors) != len(mesh.vertices):
+        return None
+    colors = np.asarray(vertex_colors)
+    if colors.ndim != 2 or colors.shape[1] < 3:
+        return None
+    colors = colors[:, :3]
+    if colors.dtype.kind == "f" and float(np.nanmax(colors)) <= 1.0:
+        colors = colors * 255.0
+    colors = np.clip(colors, 0, 255).astype(np.uint8)
+    if not np.isfinite(colors.astype(np.float32)).all():
+        return None
+    return colors
+
+
+def _simplify_colored_mesh(
+    mesh: trimesh.Trimesh,
+    max_faces: int,
+) -> trimesh.Trimesh:
+    if max_faces <= 0 or len(mesh.faces) <= max_faces:
+        return mesh.copy()
+
+    colors = _extract_mesh_vertex_rgb(mesh)
+    if colors is None:
+        return mesh.copy()
+
+    try:
+        import open3d as o3d
+
+        o3d_mesh = o3d.geometry.TriangleMesh()
+        o3d_mesh.vertices = o3d.utility.Vector3dVector(
+            np.asarray(mesh.vertices, dtype=np.float64)
+        )
+        o3d_mesh.triangles = o3d.utility.Vector3iVector(
+            np.asarray(mesh.faces, dtype=np.int32)
+        )
+        o3d_mesh.vertex_colors = o3d.utility.Vector3dVector(
+            colors.astype(np.float64) / 255.0
+        )
+        simplified = o3d_mesh.simplify_quadric_decimation(int(max_faces))
+        simplified.remove_unreferenced_vertices()
+        simplified_vertices = np.asarray(simplified.vertices, dtype=np.float64)
+        simplified_faces = np.asarray(simplified.triangles, dtype=np.int64)
+        simplified_colors = np.asarray(simplified.vertex_colors, dtype=np.float64)
+        if (
+            len(simplified_vertices) == 0
+            or len(simplified_faces) == 0
+            or len(simplified_colors) != len(simplified_vertices)
+        ):
+            raise RuntimeError("Open3D returned an empty or uncolored simplified mesh")
+        output = trimesh.Trimesh(
+            vertices=simplified_vertices,
+            faces=simplified_faces,
+            process=False,
+        )
+        output.visual.vertex_colors = np.clip(
+            simplified_colors * 255.0,
+            0,
+            255,
+        ).astype(np.uint8)
+        logger.info(
+            "Simplified textured object mesh for MuJoCo visual: faces {} -> {}",
+            len(mesh.faces),
+            len(output.faces),
+        )
+        return output
+    except Exception as exc:
+        logger.warning(
+            "Could not simplify colored object mesh to {} faces; using full mesh: {}",
+            max_faces,
+            exc,
+        )
+        return mesh.copy()
+
+
+def _write_textured_mesh_obj(
+    obj_path: Path,
+    mtl_path: Path,
+    texture_path: Path,
+    mesh: trimesh.Trimesh,
+    tile_size: int,
+) -> tuple[int, int]:
+    if tile_size < 2:
+        raise ValueError(f"object_texture_tile_size is too small: {tile_size}")
+    if len(mesh.faces) == 0:
+        raise ValueError("cannot bake a textured OBJ from a mesh with no faces")
+
+    colors = _extract_mesh_vertex_rgb(mesh)
+    if colors is None:
+        raise ValueError("source mesh does not contain per-vertex RGB colors")
+
+    face_count = int(len(mesh.faces))
+    atlas_cols = int(math.ceil(math.sqrt(face_count)))
+    atlas_rows = int(math.ceil(face_count / atlas_cols))
+    atlas_width = atlas_cols * tile_size
+    atlas_height = atlas_rows * tile_size
+    atlas = np.zeros((atlas_height, atlas_width, 3), dtype=np.uint8)
+
+    uv_triplets: list[tuple[tuple[float, float], tuple[float, float], tuple[float, float]]] = []
+    margin = 0.25
+    for face_idx, face in enumerate(np.asarray(mesh.faces, dtype=np.int64)):
+        row = face_idx // atlas_cols
+        col = face_idx % atlas_cols
+        x0 = col * tile_size
+        y0 = row * tile_size
+        face_color = np.mean(colors[face], axis=0)
+        atlas[y0 : y0 + tile_size, x0 : x0 + tile_size] = np.clip(
+            face_color,
+            0,
+            255,
+        ).astype(np.uint8)
+        left = (x0 + margin) / atlas_width
+        right = (x0 + tile_size - margin) / atlas_width
+        top = 1.0 - (y0 + margin) / atlas_height
+        bottom = 1.0 - (y0 + tile_size - margin) / atlas_height
+        uv_triplets.append(((left, bottom), (right, bottom), (left, top)))
+
+    from PIL import Image
+
+    Image.fromarray(atlas).save(texture_path)
+    with mtl_path.open("w", encoding="utf-8") as file:
+        file.write("newmtl milk_visual_texture\n")
+        file.write("Ka 1.000000 1.000000 1.000000\n")
+        file.write("Kd 1.000000 1.000000 1.000000\n")
+        file.write("Ks 0.000000 0.000000 0.000000\n")
+        file.write("Ns 1.000000\n")
+        file.write("illum 2\n")
+        file.write(f"map_Kd {texture_path.name}\n")
+
+    with obj_path.open("w", encoding="utf-8") as file:
+        file.write(f"mtllib {mtl_path.name}\n")
+        file.write("usemtl milk_visual_texture\n")
+        for vertex in np.asarray(mesh.vertices, dtype=np.float64):
+            file.write(
+                f"v {vertex[0]:.9g} {vertex[1]:.9g} {vertex[2]:.9g}\n"
+            )
+        for uv_triplet in uv_triplets:
+            for uv in uv_triplet:
+                file.write(f"vt {uv[0]:.9g} {uv[1]:.9g}\n")
+        for face_idx, face in enumerate(np.asarray(mesh.faces, dtype=np.int64)):
+            vertex_refs = face + 1
+            vt_base = face_idx * 3 + 1
+            file.write(
+                f"f {vertex_refs[0]}/{vt_base} "
+                f"{vertex_refs[1]}/{vt_base + 1} "
+                f"{vertex_refs[2]}/{vt_base + 2}\n"
+            )
+    return atlas_width, atlas_height
+
+
+def _bake_textured_mesh_assets(
+    object_mesh_dir: Path,
+    mesh: trimesh.Trimesh,
+    max_faces: int,
+    tile_size: int,
+) -> tuple[Path, Path, Path, tuple[int, int], int]:
+    textured_mesh = _simplify_colored_mesh(mesh, max_faces=max_faces)
+    obj_path = object_mesh_dir / "visual_mesh_textured.obj"
+    mtl_path = object_mesh_dir / "visual_mesh_textured.mtl"
+    texture_path = object_mesh_dir / "visual_mesh_texture.png"
+    atlas_size = _write_textured_mesh_obj(
+        obj_path=obj_path,
+        mtl_path=mtl_path,
+        texture_path=texture_path,
+        mesh=textured_mesh,
+        tile_size=tile_size,
+    )
+    return obj_path, mtl_path, texture_path, atlas_size, int(len(textured_mesh.faces))
+
+
 def _scale_object_mesh(mesh: trimesh.Trimesh, scale_factor: float) -> trimesh.Trimesh:
     if not np.isfinite(scale_factor) or scale_factor <= 0.0:
         raise ValueError(f"invalid scale_factor {scale_factor}")
@@ -1283,6 +1468,8 @@ def main(
     trajectory_interpolation_factor: int = 1,
     scene_offset_xyz: tuple[float, float, float] = (0.10, 0.0, 0.0),
     object_texture_face_resolution: int = 512,
+    object_textured_mesh_max_faces: int = 120000,
+    object_texture_tile_size: int = 4,
 ) -> None:
     workspace_path = Path(workspace).resolve()
     dataset_dir_path = Path(dataset_dir).resolve()
@@ -1548,7 +1735,7 @@ def main(
 
     object_scale_factor = float(box_data["scale_factor"])
     object_bbox_size_xyz_m = box_data["box_real_size_xyz_m"].astype(np.float32)
-    source_object_has_faces = _ply_has_faces(inputs.object_ply_path)
+    source_object_has_faces = _source_mesh_has_faces(inputs.object_ply_path)
     visual_mesh, mesh_alignment_debug = _prepare_object_mesh_for_bbox_frame(
         _load_object_mesh(inputs.object_ply_path),
         scale_factor=object_scale_factor,
@@ -1563,42 +1750,69 @@ def main(
     colored_ply_written = False
     colored_ply_num_points = 0
     colored_ply_color_source = ""
-    textured_obj_path = object_mesh_dir / "visual_textured.obj"
-    textured_mtl_path = object_mesh_dir / "visual_textured.mtl"
-    texture_png_path = object_mesh_dir / "visual_texture.png"
+    textured_obj_path = object_mesh_dir / "visual_mesh_textured.obj"
+    textured_mtl_path = object_mesh_dir / "visual_mesh_textured.mtl"
+    texture_png_path = object_mesh_dir / "visual_mesh_texture.png"
     textured_assets_written = False
     texture_atlas_size = (0, 0)
+    textured_mesh_face_count = 0
     try:
-        colored_points_raw, colored_points_rgb, colored_ply_color_source = (
-            _load_gaussian_colored_points(inputs.object_ply_path)
-        )
-        colored_points = _prepare_object_points_with_mesh_alignment(
-            colored_points_raw,
-            scale_factor=object_scale_factor,
-            mesh_alignment_debug=mesh_alignment_debug,
-        )
-        _write_colored_point_ply(
-            colored_ply_path,
-            points=colored_points,
-            colors=colored_points_rgb,
-        )
-        colored_ply_written = True
-        colored_ply_num_points = int(len(colored_points))
-        logger.info(
-            "Saved colored object PLY to {} (points={}, color_source={})",
-            colored_ply_path,
-            colored_ply_num_points,
-            colored_ply_color_source,
-        )
-        if source_object_has_faces:
-            for stale_path in [textured_obj_path, textured_mtl_path, texture_png_path]:
-                if stale_path.exists():
-                    stale_path.unlink()
+        mesh_vertex_rgb = _extract_mesh_vertex_rgb(visual_mesh)
+        if source_object_has_faces and mesh_vertex_rgb is not None:
+            _write_colored_point_ply(
+                colored_ply_path,
+                points=np.asarray(visual_mesh.vertices, dtype=np.float32),
+                colors=mesh_vertex_rgb,
+            )
+            colored_ply_written = True
+            colored_ply_num_points = int(len(visual_mesh.vertices))
+            colored_ply_color_source = f"{inputs.object_ply_path.suffix.lower()}_vertex_rgb"
+            (
+                textured_obj_path,
+                textured_mtl_path,
+                texture_png_path,
+                texture_atlas_size,
+                textured_mesh_face_count,
+            ) = _bake_textured_mesh_assets(
+                object_mesh_dir=object_mesh_dir,
+                mesh=visual_mesh,
+                max_faces=int(object_textured_mesh_max_faces),
+                tile_size=int(object_texture_tile_size),
+            )
+            textured_assets_written = True
             logger.info(
-                "Using source mesh PLY visual {}; skipped generated OBJ/MTL texture assets",
-                visual_mesh_ply_path,
+                "Saved textured object mesh assets to {}, {}, {} "
+                "(faces={}, atlas={}x{}, source={})",
+                textured_obj_path,
+                textured_mtl_path,
+                texture_png_path,
+                textured_mesh_face_count,
+                texture_atlas_size[0],
+                texture_atlas_size[1],
+                inputs.object_ply_path,
             )
         else:
+            colored_points_raw, colored_points_rgb, colored_ply_color_source = (
+                _load_gaussian_colored_points(inputs.object_ply_path)
+            )
+            colored_points = _prepare_object_points_with_mesh_alignment(
+                colored_points_raw,
+                scale_factor=object_scale_factor,
+                mesh_alignment_debug=mesh_alignment_debug,
+            )
+            _write_colored_point_ply(
+                colored_ply_path,
+                points=colored_points,
+                colors=colored_points_rgb,
+            )
+            colored_ply_written = True
+            colored_ply_num_points = int(len(colored_points))
+            logger.info(
+                "Saved colored object PLY to {} (points={}, color_source={})",
+                colored_ply_path,
+                colored_ply_num_points,
+                colored_ply_color_source,
+            )
             _, _, _, texture_atlas_size = _bake_textured_box_assets(
                 object_mesh_dir=object_mesh_dir,
                 points=colored_points,
@@ -1606,6 +1820,9 @@ def main(
                 bbox_size_xyz_m=object_bbox_size_xyz_m,
                 face_resolution=int(object_texture_face_resolution),
             )
+            textured_obj_path = object_mesh_dir / "visual_textured.obj"
+            textured_mtl_path = object_mesh_dir / "visual_textured.mtl"
+            texture_png_path = object_mesh_dir / "visual_texture.png"
             textured_assets_written = True
             logger.info(
                 "Saved textured object box assets to {}, {}, {} (atlas={}x{})",
@@ -1665,7 +1882,11 @@ def main(
         "object_scale_factor": object_scale_factor,
         "object_colored_ply_num_points": colored_ply_num_points,
         "object_colored_ply_color_source": colored_ply_color_source,
+        "object_visual_source_path": str(inputs.object_ply_path),
         "object_texture_face_resolution": int(object_texture_face_resolution),
+        "object_textured_mesh_max_faces": int(object_textured_mesh_max_faces),
+        "object_texture_tile_size": int(object_texture_tile_size),
+        "object_textured_mesh_face_count": int(textured_mesh_face_count),
         "object_texture_atlas_size": list(texture_atlas_size),
         "object_orientation_policy": orientation_policy,
         "align_object_mesh_to_bbox": align_object_mesh_to_bbox,
@@ -1760,6 +1981,18 @@ def main(
         ),
         object_texture_face_resolution=np.array(
             int(object_texture_face_resolution),
+            dtype=np.int32,
+        ),
+        object_textured_mesh_max_faces=np.array(
+            int(object_textured_mesh_max_faces),
+            dtype=np.int32,
+        ),
+        object_texture_tile_size=np.array(
+            int(object_texture_tile_size),
+            dtype=np.int32,
+        ),
+        object_textured_mesh_face_count=np.array(
+            int(textured_mesh_face_count),
             dtype=np.int32,
         ),
         object_texture_atlas_size=np.asarray(texture_atlas_size, dtype=np.int32),

@@ -3,10 +3,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-export CUDA_VISIBLE_DEVICES=7
+export CUDA_VISIBLE_DEVICES=2
 
-export MUJOCO_GL=osmesa
-export PYOPENGL_PLATFORM=osmesa
+export LIBRARY_PATH="$HOME/.local/libcuda:${LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
 
 bash examples/asm/run_ik_asm.sh
 
@@ -22,7 +25,7 @@ env -u LD_LIBRARY_PATH python examples/run_mjwp.py \
   show_viewer=false \
   save_video=true \
   save_info=true \
-  contact_guidance=true \
-  num_samples=32 \
+  contact_guidance=false \
+  num_samples=64 \
   max_num_iterations=4 \
   max_sim_steps=-1

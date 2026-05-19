@@ -737,22 +737,40 @@ def scale_urdf_collision_meshes(
 
 def _collision_proxy_kind(geom_name: str) -> str:
     if geom_name.startswith("collision_body_"):
-        return "box"
+        return "body_box"
     if geom_name.startswith("collision_hand_") and "_palm" in geom_name:
-        return "box"
+        return "palm_box"
+    if geom_name.startswith("collision_hand_"):
+        return "finger_capsule"
+    if geom_name.startswith("collision_arm_"):
+        return "arm_capsule"
     return "capsule"
 
 
-def _capsule_axis_from_vertices(vertices: np.ndarray) -> np.ndarray:
-    centered = vertices - vertices.mean(axis=0)
+def _pca_frame(vertices: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    center = vertices.mean(axis=0)
+    centered = vertices - center
     if vertices.shape[0] >= 3 and np.linalg.norm(centered) > 0:
         try:
             _, _, vh = np.linalg.svd(centered, full_matrices=False)
-            axis = vh[0]
-            if np.isfinite(axis).all() and np.linalg.norm(axis) > 0:
-                return axis / np.linalg.norm(axis)
+            axes = vh.T
+            if np.linalg.det(axes) < 0:
+                axes[:, -1] *= -1.0
+            variances = centered.var(axis=0)
+            if np.isfinite(axes).all():
+                return center, axes, variances
         except np.linalg.LinAlgError:
             pass
+    axes = np.eye(3, dtype=np.float64)
+    variances = centered.var(axis=0) if vertices.size else np.zeros(3, dtype=np.float64)
+    return center, axes, variances
+
+
+def _capsule_axis_from_vertices(vertices: np.ndarray) -> np.ndarray:
+    _, axes, _ = _pca_frame(vertices)
+    axis = axes[:, 0]
+    if np.isfinite(axis).all() and np.linalg.norm(axis) > 0:
+        return axis / np.linalg.norm(axis)
     extents = vertices.max(axis=0) - vertices.min(axis=0)
     axis = np.zeros(3, dtype=np.float64)
     axis[int(np.argmax(extents))] = 1.0
@@ -768,17 +786,40 @@ def _set_collision_geom_common_attrs(geom: ET.Element) -> None:
     geom.set("rgba", geom.get("rgba", "0 0.8 1 0.28"))
 
 
+def _disable_collision_proxy(geom: ET.Element) -> None:
+    geom.set("contype", "0")
+    geom.set("conaffinity", "0")
+    geom.set("density", "0")
+    geom.set("group", "6")
+    geom.set("rgba", "0 0 0 0")
+
+
+def _matrix_to_quat_wxyz(rotation_matrix: np.ndarray) -> np.ndarray:
+    quat_xyzw = R.from_matrix(rotation_matrix).as_quat()
+    return np.array(
+        [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]],
+        dtype=np.float64,
+    )
+
+
 def _convert_collision_geom_to_box(
     geom: ET.Element,
     vertices: np.ndarray,
     proxy_scale: float,
     min_half_size: float,
-) -> None:
-    lower = vertices.min(axis=0)
-    upper = vertices.max(axis=0)
-    center = 0.5 * (lower + upper)
+    *,
+    max_half_extent: float | None = None,
+) -> dict[str, object]:
+    center, axes, _ = _pca_frame(vertices)
+    local = (vertices - center) @ axes
+    lower = local.min(axis=0)
+    upper = local.max(axis=0)
+    local_center = 0.5 * (lower + upper)
     half_extents = 0.5 * (upper - lower) * float(proxy_scale)
     half_extents = np.maximum(half_extents, float(min_half_size))
+    if max_half_extent is not None:
+        half_extents = np.minimum(half_extents, float(max_half_extent))
+    center = center + axes @ local_center
 
     original_pos = parse_vec_attr(geom, "pos", 3, np.zeros(3, dtype=np.float64))
     original_quat = parse_vec_attr(
@@ -787,15 +828,25 @@ def _convert_collision_geom_to_box(
         4,
         np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
     )
-    box_pos = original_pos + quat_wxyz_to_matrix(original_quat) @ center
+    original_rot = quat_wxyz_to_matrix(original_quat)
+    box_pos = original_pos + original_rot @ center
+    box_rot = original_rot @ axes
+    box_quat = _matrix_to_quat_wxyz(box_rot)
 
     for attr in ("mesh", "fromto", "euler", "axisangle", "xyaxes", "zaxis"):
         geom.attrib.pop(attr, None)
     geom.set("type", "box")
     geom.set("size", fmt_vec(half_extents))
     geom.set("pos", fmt_vec(box_pos))
-    geom.set("quat", fmt_vec(original_quat))
+    geom.set("quat", fmt_vec(box_quat))
     _set_collision_geom_common_attrs(geom)
+    return {
+        "proxy_type": "box",
+        "center": box_pos.tolist(),
+        "half_extents": half_extents.tolist(),
+        "axis": box_rot[:, 0].tolist(),
+        "reason": "oriented_bbox",
+    }
 
 
 def _convert_collision_geom_to_capsule(
@@ -808,10 +859,12 @@ def _convert_collision_geom_to_capsule(
     radius_scale: float,
     min_radius: float,
     min_half_length: float,
-) -> tuple[float, float, bool]:
+    max_radius: float | None = None,
+    fallback_aspect_ratio: float = 1.25,
+) -> dict[str, object]:
     axis = _capsule_axis_from_vertices(vertices)
-    center = vertices.mean(axis=0)
-    centered = vertices - center
+    line_center = vertices.mean(axis=0)
+    centered = vertices - line_center
     projections = centered @ axis
     low_q = 0.5 * (1.0 - float(length_quantile))
     high_q = 1.0 - low_q
@@ -823,14 +876,28 @@ def _convert_collision_geom_to_capsule(
     if degenerate:
         half_length = float(min_half_length)
 
-    radial = centered - np.outer(projections, axis)
+    in_middle = (projections >= lower_proj) & (projections <= upper_proj)
+    selected_centered = centered[in_middle] if np.any(in_middle) else centered
+    selected_projections = projections[in_middle] if np.any(in_middle) else projections
+    radial = selected_centered - np.outer(selected_projections, axis)
     radial_dist = np.linalg.norm(radial, axis=1)
     radius = float(np.quantile(radial_dist, radius_quantile))
     radius *= float(radius_scale) * float(proxy_scale)
     radius = max(radius, float(min_radius))
+    if max_radius is not None:
+        radius = min(radius, float(max_radius))
 
-    endpoint_a = center + (midpoint_proj - half_length) * axis
-    endpoint_b = center + (midpoint_proj + half_length) * axis
+    if half_length / max(radius, 1e-9) < fallback_aspect_ratio:
+        return _convert_collision_geom_to_box(
+            geom,
+            vertices,
+            proxy_scale,
+            min_half_size=max(min_radius, 0.001),
+            max_half_extent=max_radius,
+        )
+
+    endpoint_a = line_center + (midpoint_proj - half_length) * axis
+    endpoint_b = line_center + (midpoint_proj + half_length) * axis
     original_pos = parse_vec_attr(geom, "pos", 3, np.zeros(3, dtype=np.float64))
     original_quat = parse_vec_attr(
         geom,
@@ -848,7 +915,90 @@ def _convert_collision_geom_to_capsule(
     geom.set("fromto", fmt_vec(np.concatenate([endpoint_a_body, endpoint_b_body])))
     geom.set("size", fmt_vec(np.array([radius], dtype=np.float64)))
     _set_collision_geom_common_attrs(geom)
-    return radius, 2.0 * half_length, bool(degenerate)
+    return {
+        "proxy_type": "capsule",
+        "axis": (original_rot @ axis).tolist(),
+        "center": (0.5 * (endpoint_a_body + endpoint_b_body)).tolist(),
+        "radius": float(radius),
+        "length": float(2.0 * half_length),
+        "trim_percentile": [float(low_q), float(high_q)],
+        "reason": "trimmed_pca_capsule",
+        "degenerate": bool(degenerate),
+    }
+
+
+def _convert_new_collision_proxy(
+    geom: ET.Element,
+    vertices: np.ndarray,
+    proxy_scale: float,
+    min_half_size: float,
+) -> dict[str, object]:
+    geom_name = geom.get("name", "")
+    kind = _collision_proxy_kind(geom_name)
+
+    if kind == "body_box":
+        if any(token in geom_name for token in ("base_link1", "base_link2", "base_r", "base_l")):
+            _disable_collision_proxy(geom)
+            return {
+                "proxy_type": "skipped",
+                "reason": "large_fixed_base_proxy_hidden",
+            }
+        return _convert_collision_geom_to_box(
+            geom,
+            vertices,
+            proxy_scale,
+            min_half_size,
+            max_half_extent=0.08,
+        )
+
+    if kind == "palm_box":
+        return _convert_collision_geom_to_box(
+            geom,
+            vertices,
+            proxy_scale=min(float(proxy_scale), 0.92),
+            min_half_size=min_half_size,
+            max_half_extent=0.07,
+        )
+
+    if kind == "finger_capsule":
+        return _convert_collision_geom_to_capsule(
+            geom,
+            vertices,
+            proxy_scale=proxy_scale,
+            length_quantile=0.84,
+            radius_quantile=0.68,
+            radius_scale=0.95,
+            min_radius=0.0015,
+            min_half_length=0.003,
+            max_radius=0.011,
+            fallback_aspect_ratio=1.15,
+        )
+
+    if kind == "arm_capsule":
+        return _convert_collision_geom_to_capsule(
+            geom,
+            vertices,
+            proxy_scale=proxy_scale,
+            length_quantile=0.78,
+            radius_quantile=0.78,
+            radius_scale=1.03,
+            min_radius=0.006,
+            min_half_length=0.018,
+            max_radius=0.055,
+            fallback_aspect_ratio=1.35,
+        )
+
+    return _convert_collision_geom_to_capsule(
+        geom,
+        vertices,
+        proxy_scale=proxy_scale,
+        length_quantile=0.8,
+        radius_quantile=0.7,
+        radius_scale=1.0,
+        min_radius=0.002,
+        min_half_length=0.004,
+        max_radius=0.04,
+    )
 
 
 def replace_collision_meshes_with_primitive_proxies(
@@ -870,9 +1020,11 @@ def replace_collision_meshes_with_primitive_proxies(
 
     converted = 0
     skipped = 0
+    hidden = 0
     box_count = 0
     capsule_count = 0
     degenerate_capsules = 0
+    proxy_records: list[dict[str, object]] = []
     radius_values: list[float] = []
     length_values: list[float] = []
     for geom in root.iter("geom"):
@@ -885,35 +1037,26 @@ def replace_collision_meshes_with_primitive_proxies(
             skipped += 1
             continue
 
-        if _collision_proxy_kind(geom_name) == "box":
-            _convert_collision_geom_to_box(
-                geom,
-                vertices,
-                proxy_scale,
-                min_half_size,
-            )
+        record = _convert_new_collision_proxy(geom, vertices, proxy_scale, min_half_size)
+        record["geom_name"] = geom_name
+        record["source_mesh"] = mesh_name
+        proxy_records.append(record)
+        if record.get("proxy_type") == "box":
             box_count += 1
-        else:
-            radius, length, degenerate = _convert_collision_geom_to_capsule(
-                geom,
-                vertices,
-                proxy_scale,
-                length_quantile=capsule_length_quantile,
-                radius_quantile=capsule_radius_quantile,
-                radius_scale=capsule_radius_scale,
-                min_radius=capsule_min_radius,
-                min_half_length=capsule_min_half_length,
-            )
+        elif record.get("proxy_type") == "capsule":
             capsule_count += 1
-            degenerate_capsules += int(degenerate)
-            radius_values.append(radius)
-            length_values.append(length)
+            degenerate_capsules += int(bool(record.get("degenerate", False)))
+            radius_values.append(float(record.get("radius", 0.0)))
+            length_values.append(float(record.get("length", 0.0)))
+        elif record.get("proxy_type") == "skipped":
+            hidden += 1
         converted += 1
 
     return {
         "primitive_proxy_scale": float(proxy_scale),
         "converted_collision_geoms": converted,
         "skipped_collision_geoms": skipped,
+        "hidden_collision_geoms": hidden,
         "box_collision_geoms": box_count,
         "capsule_collision_geoms": capsule_count,
         "degenerate_capsule_geoms": degenerate_capsules,
@@ -921,6 +1064,7 @@ def replace_collision_meshes_with_primitive_proxies(
         "capsule_radius_max": float(max(radius_values)) if radius_values else 0.0,
         "capsule_length_min": float(min(length_values)) if length_values else 0.0,
         "capsule_length_max": float(max(length_values)) if length_values else 0.0,
+        "proxy_records": proxy_records,
     }
 
 
@@ -1214,6 +1358,7 @@ def validate_model(xml_path: Path, variant: str) -> None:
     if model.nu <= 0:
         raise RuntimeError(f"No actuators in {xml_path}")
     collision_count = 0
+    disabled_collision_count = 0
     hand_collision_count = 0
     arm_collision_count = 0
     body_collision_count = 0
@@ -1235,7 +1380,8 @@ def validate_model(xml_path: Path, variant: str) -> None:
         geom_type = geom_type_names.get(int(model.geom_type[gid]), str(int(model.geom_type[gid])))
         collision_type_counts[geom_type] = collision_type_counts.get(geom_type, 0) + 1
         if model.geom_contype[gid] == 0 or model.geom_conaffinity[gid] == 0:
-            raise RuntimeError(f"Disabled robot collision geom in {xml_path}: {name}")
+            disabled_collision_count += 1
+            continue
         collision_count += 1
         if name.startswith("collision_hand_"):
             hand_collision_count += 1
@@ -1248,28 +1394,35 @@ def validate_model(xml_path: Path, variant: str) -> None:
     if hand_collision_count == 0:
         raise RuntimeError(f"No collision_hand_ geoms in {xml_path}")
     if variant in {"bimanual", "right"} and not any(
-        (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid) or "").startswith(
-            ("collision_hand_right_", "collision_arm_right_")
+        (
+            (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid) or "").startswith(
+                ("collision_hand_right_", "collision_arm_right_")
+            )
+            and model.geom_contype[gid] != 0
+            and model.geom_conaffinity[gid] != 0
         )
         for gid in range(model.ngeom)
     ):
         raise RuntimeError(f"No right-side URDF collision meshes in {xml_path}")
     if variant in {"bimanual", "left"} and not any(
-        (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid) or "").startswith(
-            ("collision_hand_left_", "collision_arm_left_")
+        (
+            (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid) or "").startswith(
+                ("collision_hand_left_", "collision_arm_left_")
+            )
+            and model.geom_contype[gid] != 0
+            and model.geom_conaffinity[gid] != 0
         )
         for gid in range(model.ngeom)
     ):
         raise RuntimeError(f"No left-side URDF collision meshes in {xml_path}")
     if arm_collision_count == 0:
         raise RuntimeError(f"No collision_arm_ geoms in {xml_path}")
-    if body_collision_count == 0:
-        raise RuntimeError(f"No collision_body_ geoms in {xml_path}")
     print(
         f"{variant}: nq={model.nq} nv={model.nv} nu={model.nu} "
         f"nsite={model.nsite} ngeom={model.ngeom} "
         f"nexclude={getattr(model, 'nexclude', 0)} "
         f"collision_asm={collision_count} "
+        f"collision_disabled={disabled_collision_count} "
         f"collision_types={collision_type_counts} "
         f"collision_hand={hand_collision_count} "
         f"collision_arm={arm_collision_count} "
@@ -1307,7 +1460,13 @@ def write_collision_proxy_color_manifest(
     collision_mode: str,
     collision_mesh_scale: float,
     source_urdf: Path,
+    proxy_records: list[dict[str, object]] | None = None,
 ) -> None:
+    record_map = {
+        str(record.get("geom_name")): record
+        for record in (proxy_records or [])
+        if record.get("geom_name")
+    }
     entries: list[dict[str, object]] = []
     for geom in root.iter("geom"):
         geom_name = geom.get("name", "")
@@ -1316,17 +1475,29 @@ def write_collision_proxy_color_manifest(
         mesh_name = geom.get("mesh", "")
         metadata = _collision_proxy_metadata(geom_name, mesh_name)
         fallback_rgba = list(metadata["rgba"])  # type: ignore[arg-type]
+        record = record_map.get(geom_name, {})
+        geom_type = geom.get("type", "mesh" if mesh_name else "unknown")
+        proxy_type = record.get("proxy_type", geom_type)
         entries.append(
             {
                 "geom_name": geom_name,
-                "geom_type": geom.get("type", "mesh" if mesh_name else "unknown"),
+                "geom_type": geom_type,
+                "proxy_type": proxy_type,
                 "mesh_name": mesh_name,
+                "source_mesh": record.get("source_mesh", mesh_name),
                 "component": metadata["component"],
                 "side": metadata["side"],
                 "link_key": metadata["link_key"],
                 "link_label": metadata["link_label"],
                 "color_hex": metadata["color_hex"],
                 "rgba": _parse_rgba_string(geom.get("rgba"), fallback_rgba),
+                "axis": record.get("axis"),
+                "center": record.get("center"),
+                "radius": record.get("radius"),
+                "length": record.get("length"),
+                "half_extents": record.get("half_extents"),
+                "trim_percentile": record.get("trim_percentile"),
+                "reason": record.get("reason"),
             }
         )
 
@@ -1335,6 +1506,7 @@ def write_collision_proxy_color_manifest(
         "collision_mesh_scale": float(collision_mesh_scale),
         "source_urdf": str(source_urdf),
         "num_entries": len(entries),
+        "proxy_algorithm": "NewCollision trimmed PCA capsule / oriented bbox",
         "entries": entries,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1368,10 +1540,11 @@ def main() -> None:
             args.collision_mesh_scale,
         )
         print(
-            "Generated ASM primitive collision proxies: "
+            "Generated ASM NewCollision primitive proxies: "
             f"scale={collision_proxy_stats['primitive_proxy_scale']} "
             f"converted={collision_proxy_stats['converted_collision_geoms']} "
             f"skipped={collision_proxy_stats['skipped_collision_geoms']} "
+            f"hidden={collision_proxy_stats['hidden_collision_geoms']} "
             f"boxes={collision_proxy_stats['box_collision_geoms']} "
             f"capsules={collision_proxy_stats['capsule_collision_geoms']} "
             f"degenerate_capsules={collision_proxy_stats['degenerate_capsule_geoms']}"
@@ -1406,12 +1579,18 @@ def main() -> None:
     )
     add_position_actuators(root, args.arm_kp, args.hand_kp)
     manifest_path = output_dir / "collision_proxy_colors.json"
+    proxy_records = (
+        collision_proxy_stats.get("proxy_records", [])
+        if args.collision_geometry_mode == "primitive"
+        else []
+    )
     write_collision_proxy_color_manifest(
         root,
         manifest_path,
         collision_mode=args.collision_geometry_mode,
         collision_mesh_scale=args.collision_mesh_scale,
         source_urdf=source_urdf,
+        proxy_records=proxy_records,  # type: ignore[arg-type]
     )
 
     for variant in args.variants:

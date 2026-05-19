@@ -15,10 +15,10 @@ cd "$(dirname "$0")/../.."
 #       - scene_eq.xml
 #       - task_info.json
 
-export MUJOCO_GL=osmesa
-export PYOPENGL_PLATFORM=osmesa
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
 
-env -u LD_LIBRARY_PATH python spider/preprocess/prepare_asm_mjcf.py \
+env -u LD_LIBRARY_PATH python spider/preprocess/prepare_asm_mjcf_PickSpoonBowl.py \
   --dataset-dir example_datasets \
   --dataset-name oakink \
   --source-urdf spider/assets/robots/asm_description/urdf/asm.urdf \
@@ -32,9 +32,10 @@ env -u LD_LIBRARY_PATH python spider/preprocess/prepare_asm_mjcf.py \
   --arm-frictionloss 0.0 \
   --hand-frictionloss 0.01 \
   --hand-force-scale 2.0 \
+  --root-yaw-deg 0 \
   --variants bimanual right left
 
-env -u LD_LIBRARY_PATH python spider/preprocess/generate_xml.py \
+env -u LD_LIBRARY_PATH python spider/preprocess/generate_xml_PickSpoonBowl.py \
   --dataset-dir example_datasets \
   --dataset-name oakink \
   --robot-type asm \
@@ -43,7 +44,7 @@ env -u LD_LIBRARY_PATH python spider/preprocess/generate_xml.py \
   --data-id 0 \
   --no-show-viewer
 
-env -u LD_LIBRARY_PATH python spider/preprocess/generate_xml.py \
+env -u LD_LIBRARY_PATH python spider/preprocess/generate_xml_PickSpoonBowl.py \
   --dataset-dir example_datasets \
   --dataset-name oakink \
   --robot-type asm \
