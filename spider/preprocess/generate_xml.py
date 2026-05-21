@@ -72,12 +72,12 @@ def _add_front_camera(
             # OakInk bowl/spoon places the workspace on +Y and the ASM root is
             # rotated to face +Y, so the front render camera should also sit on
             # +Y looking back toward the robot.
-            pos = [0.0, 3.15, 1.45]
-            target = [0.0, 0.12, 0.72]
+            pos = [0.0, 2.2, 1.25]
+            target = [0.0, 0.45, 0.88]
         else:
             # Camera-aligned scenes such as milk keep ASM front on +X.
-            pos = [3.15, 0.0, 1.45]
-            target = [0.12, 0.0, 0.72]
+            pos = [2.2, 0.0, 1.25]
+            target = [0.45, 0.0, 0.88]
         mj_spec.worldbody.add_camera(
             name="front",
             pos=pos,
@@ -407,30 +407,91 @@ def _bind_groundplane_material_textures(xml_text: str) -> str:
         if texture is not None:
             material.set("texture", texture)
 
+    _apply_render_lighting(root)
+
     try:
         ET.indent(root, space="  ")
     except AttributeError:
         pass
     return ET.tostring(root, encoding="unicode")
 
+
+def _apply_render_lighting(root: ET.Element) -> None:
+    asset = root.find("asset")
+    worldbody = root.find("worldbody")
+
+    visual = root.find("visual")
+    if visual is None:
+        visual = ET.Element("visual")
+        insert_idx = list(root).index(asset) if asset is not None else 0
+        root.insert(insert_idx, visual)
+
+    headlight = visual.find("headlight")
+    if headlight is None:
+        headlight = ET.SubElement(visual, "headlight")
+    headlight.set("ambient", "0.12 0.12 0.12")
+    headlight.set("diffuse", "0.22 0.22 0.22")
+    headlight.set("specular", "0.03 0.03 0.03")
+
+    if worldbody is None:
+        return
+
+    light_specs = [
+        {
+            "name": "front_key_light",
+            "pos": "1.8 -0.8 2.6",
+            "dir": "-0.7 0.25 -1",
+            "directional": "true",
+            "ambient": "0.04 0.04 0.04",
+            "diffuse": "0.25 0.25 0.25",
+            "specular": "0.02 0.02 0.02",
+            "castshadow": "false",
+        },
+        {
+            "name": "top_fill_light",
+            "pos": "0.2 0 3.0",
+            "dir": "0 0 -1",
+            "directional": "true",
+            "ambient": "0.03 0.03 0.03",
+            "diffuse": "0.18 0.18 0.18",
+            "specular": "0.01 0.01 0.01",
+            "castshadow": "false",
+        },
+    ]
+    light_names = {spec["name"] for spec in light_specs}
+    for light in list(worldbody.findall("light")):
+        if light.get("name") in light_names:
+            worldbody.remove(light)
+    for insert_idx, spec in enumerate(light_specs):
+        worldbody.insert(insert_idx, ET.Element("light", spec))
+
 # 选择物体 obj，将物体加入到 xml
 def _select_object_visual_file(
     mesh_dir: str | None,
     use_visual_mesh_as_collision: bool,
-) -> tuple[str | None, bool]:
+) -> tuple[str | None, str | None, bool]:
     if not mesh_dir:
-        return None, False
+        return None, None, False
     plain_visual_file = f"{mesh_dir}/visual.obj"
+    mesh_textured_visual_file = f"{mesh_dir}/visual_mesh_textured.obj"
+    mesh_texture_file = f"{mesh_dir}/visual_mesh_texture.png"
     textured_visual_file = f"{mesh_dir}/visual_textured.obj"
+    texture_file = f"{mesh_dir}/visual_texture.png"
+    if (
+        not use_visual_mesh_as_collision
+        and os.path.exists(mesh_textured_visual_file)
+        and os.path.exists(mesh_texture_file)
+    ):
+        return mesh_textured_visual_file, mesh_texture_file, True
     if (
         not use_visual_mesh_as_collision
         and os.path.exists(textured_visual_file)
-        and os.path.exists(f"{mesh_dir}/visual_texture.png")
+        and os.path.exists(texture_file)
     ):
-        return textured_visual_file, True
+        return textured_visual_file, texture_file, True
     # MuJoCo's mesh compiler does not decode PLY in this environment; keep PLY
     # outputs only as dataset/debug artifacts and load OBJ visual meshes here.
-    return plain_visual_file, False
+    return plain_visual_file, None, False
 
 
 def _add_support_table_pairs(
@@ -813,11 +874,11 @@ def main(
         )
 
     # Visual meshes (non-colliding)
-    right_visual_file, right_visual_is_textured = _select_object_visual_file(
+    right_visual_file, right_visual_texture_file, right_visual_is_textured = _select_object_visual_file(
         right_mesh_dir,
         use_visual_mesh_as_collision,
     )
-    left_visual_file, left_visual_is_textured = _select_object_visual_file(
+    left_visual_file, left_visual_texture_file, left_visual_is_textured = _select_object_visual_file(
         left_mesh_dir,
         use_visual_mesh_as_collision,
     )
@@ -832,9 +893,9 @@ def main(
             right_mesh_kwargs["inertia"] = mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL
         # 把物体 obj mesh 加入到 xml
         mj_spec.add_mesh(**right_mesh_kwargs)
-        if right_visual_is_textured and right_mesh_dir:
+        if right_visual_is_textured and right_visual_texture_file:
             texture_rel = os.path.relpath(
-                f"{right_mesh_dir}/visual_texture.png",
+                right_visual_texture_file,
                 assets_root_dir,
             )
             mj_spec.add_texture(
@@ -860,9 +921,9 @@ def main(
         if left_visual_is_textured:
             left_mesh_kwargs["inertia"] = mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL
         mj_spec.add_mesh(**left_mesh_kwargs)
-        if left_visual_is_textured and left_mesh_dir:
+        if left_visual_is_textured and left_visual_texture_file:
             texture_rel = os.path.relpath(
-                f"{left_mesh_dir}/visual_texture.png",
+                left_visual_texture_file,
                 assets_root_dir,
             )
             mj_spec.add_texture(

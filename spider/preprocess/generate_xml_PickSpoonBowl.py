@@ -62,9 +62,9 @@ def _add_front_camera(
     support_table_spec=None,
 ) -> None:
     if robot_type == "asm":
-        # PickSpoonBowl variant: ASM front, table, objects, and render camera all use +X.
-        pos = [3.15, 0.0, 1.45]
-        target = [0.12, 0.0, 0.72]
+        # Match the milk ASM front render camera: +X looking back at the table.
+        pos = [2.2, 0.0, 1.25]
+        target = [0.45, 0.0, 0.88]
         mj_spec.worldbody.add_camera(
             name="front",
             pos=pos,
@@ -392,11 +392,63 @@ def _bind_groundplane_material_textures(xml_text: str) -> str:
         if texture is not None:
             material.set("texture", texture)
 
+    _apply_render_lighting(root)
+
     try:
         ET.indent(root, space="  ")
     except AttributeError:
         pass
     return ET.tostring(root, encoding="unicode")
+
+
+def _apply_render_lighting(root: ET.Element) -> None:
+    asset = root.find("asset")
+    worldbody = root.find("worldbody")
+
+    visual = root.find("visual")
+    if visual is None:
+        visual = ET.Element("visual")
+        insert_idx = list(root).index(asset) if asset is not None else 0
+        root.insert(insert_idx, visual)
+
+    headlight = visual.find("headlight")
+    if headlight is None:
+        headlight = ET.SubElement(visual, "headlight")
+    headlight.set("ambient", "0.12 0.12 0.12")
+    headlight.set("diffuse", "0.22 0.22 0.22")
+    headlight.set("specular", "0.03 0.03 0.03")
+
+    if worldbody is None:
+        return
+
+    light_specs = [
+        {
+            "name": "front_key_light",
+            "pos": "1.8 -0.8 2.6",
+            "dir": "-0.7 0.25 -1",
+            "directional": "true",
+            "ambient": "0.04 0.04 0.04",
+            "diffuse": "0.25 0.25 0.25",
+            "specular": "0.02 0.02 0.02",
+            "castshadow": "false",
+        },
+        {
+            "name": "top_fill_light",
+            "pos": "0.2 0 3.0",
+            "dir": "0 0 -1",
+            "directional": "true",
+            "ambient": "0.03 0.03 0.03",
+            "diffuse": "0.18 0.18 0.18",
+            "specular": "0.01 0.01 0.01",
+            "castshadow": "false",
+        },
+    ]
+    light_names = {spec["name"] for spec in light_specs}
+    for light in list(worldbody.findall("light")):
+        if light.get("name") in light_names:
+            worldbody.remove(light)
+    for insert_idx, spec in enumerate(light_specs):
+        worldbody.insert(insert_idx, ET.Element("light", spec))
 
 
 def _add_support_table_pairs(

@@ -5,14 +5,6 @@ cd "$(dirname "$0")/../.."
 
 DATA_ID=0
 ASM_COLLISION_MESH_SCALE=1.0
-if ! [[ "${DATA_ID}" =~ ^[0-9]+$ ]]; then
-  echo "DATA_ID must be a non-negative integer, got: ${DATA_ID}" >&2
-  exit 2
-fi
-if ! [[ "${ASM_COLLISION_MESH_SCALE}" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
-  echo "ASM_COLLISION_MESH_SCALE must be a positive number, got: ${ASM_COLLISION_MESH_SCALE}" >&2
-  exit 2
-fi
 export DATA_ID
 
 export MUJOCO_GL=egl
@@ -54,9 +46,6 @@ env -u LD_LIBRARY_PATH python spider/preprocess/generate_xml.py \
   --support-table-collision-mode object_and_manipulator \
   --support-table-height-mode trajectory_min \
   --support-table-z-offset=-0.05 \
-  --no-robot-object-collision \
-  --no-object-object-collision \
-  --no-object-floor-collision \
   --no-show-viewer
 
 # env -u LD_LIBRARY_PATH python spider/preprocess/generate_xml.py \
