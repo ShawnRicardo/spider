@@ -20,6 +20,7 @@ from spider.io import get_processed_data_dir
 from spider.preprocess.workspace_support import (
     SUPPORT_TABLE_HALF_THICKNESS,
     SUPPORT_TABLE_MARGIN,
+    SUPPORT_TABLE_COLLISION_MODE_NONE,
     SUPPORT_TABLE_COLLISION_MODE_OBJECT_AND_HAND,
     SUPPORT_TABLE_COLLISION_MODE_OBJECT_AND_MANIPULATOR,
     SUPPORT_TABLE_COLLISION_MODE_OBJECT_ONLY,
@@ -419,17 +420,16 @@ def _select_object_visual_file(
 ) -> tuple[str | None, bool]:
     if not mesh_dir:
         return None, False
-    mesh_ply_visual_file = f"{mesh_dir}/visual_mesh.ply"
     plain_visual_file = f"{mesh_dir}/visual.obj"
     textured_visual_file = f"{mesh_dir}/visual_textured.obj"
-    if not use_visual_mesh_as_collision and os.path.exists(mesh_ply_visual_file):
-        return mesh_ply_visual_file, False
     if (
         not use_visual_mesh_as_collision
         and os.path.exists(textured_visual_file)
         and os.path.exists(f"{mesh_dir}/visual_texture.png")
     ):
         return textured_visual_file, True
+    # MuJoCo's mesh compiler does not decode PLY in this environment; keep PLY
+    # outputs only as dataset/debug artifacts and load OBJ visual meshes here.
     return plain_visual_file, False
 
 
@@ -491,13 +491,14 @@ def main(
 ):
     dataset_dir = os.path.abspath(dataset_dir)
     if support_table_collision_mode not in {
+        SUPPORT_TABLE_COLLISION_MODE_NONE,
         SUPPORT_TABLE_COLLISION_MODE_OBJECT_ONLY,
         SUPPORT_TABLE_COLLISION_MODE_OBJECT_AND_HAND,
         SUPPORT_TABLE_COLLISION_MODE_OBJECT_AND_MANIPULATOR,
     }:
         raise ValueError(
             "support_table_collision_mode must be one of "
-            f"{[SUPPORT_TABLE_COLLISION_MODE_OBJECT_ONLY, SUPPORT_TABLE_COLLISION_MODE_OBJECT_AND_HAND, SUPPORT_TABLE_COLLISION_MODE_OBJECT_AND_MANIPULATOR]}, "
+            f"{[SUPPORT_TABLE_COLLISION_MODE_NONE, SUPPORT_TABLE_COLLISION_MODE_OBJECT_ONLY, SUPPORT_TABLE_COLLISION_MODE_OBJECT_AND_HAND, SUPPORT_TABLE_COLLISION_MODE_OBJECT_AND_MANIPULATOR]}, "
             f"got {support_table_collision_mode!r}"
         )
     if support_table_height_mode not in {
@@ -1135,6 +1136,8 @@ def main(
                 density=10,
                 rgba=[0.0, 0.0, 0.0, 0.0],
                 group=3,
+                contype=0,
+                conaffinity=0,
             )
             left_joint_handle.frictionloss = 1.0
             left_joint_handle.armature = 1.0

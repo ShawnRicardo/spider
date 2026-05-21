@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=7
 
 export LIBRARY_PATH="$HOME/.local/libcuda:${LIBRARY_PATH:-}"
 export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"

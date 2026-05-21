@@ -103,6 +103,29 @@ FALLBACK_COLOR_HEX = (
     "#00f5d4",
     "#f15bb5",
 )
+ARM_CAPSULE_RADIUS_AT_SCALE_1_BY_LINK = {
+    1: 0.036,
+    2: 0.036,
+    3: 0.032,
+    4: 0.032,
+    5: 0.030,
+    6: 0.026,
+    7: 0.026,
+}
+ARM_CAPSULE_FALLBACK_LENGTH_BY_LINK = {
+    1: 0.12,
+    2: 0.24,
+    3: 0.12,
+    4: 0.24,
+    5: 0.14,
+    6: 0.08,
+    7: 0.12,
+}
+ARM_CAPSULE_TRIM_MARGIN_M = 0.015
+ARM_CAPSULE_MIN_HALF_LENGTH_M = 0.018
+ARM_CAPSULE_CHILD_VECTOR_MIN_LENGTH_M = 0.06
+ARM_CAPSULE_SCALE_MIN = 0.35
+ARM_CAPSULE_SCALE_MAX = 1.30
 
 
 def parse_args() -> argparse.Namespace:
@@ -498,12 +521,16 @@ def _is_mesh_geom(geom: ET.Element) -> bool:
     return geom.get("type") == "mesh" or "mesh" in geom.attrib
 
 
-def _is_urdf_collision_mesh_geom(geom: ET.Element) -> bool:
-    if not _is_mesh_geom(geom):
-        return False
-    # MuJoCo's URDF importer emits visual meshes with explicit 0/0 contact
-    # masks and collision meshes with active or omitted contact masks.
-    return not (geom.get("contype") == "0" and geom.get("conaffinity") == "0")
+def _is_explicitly_non_colliding_geom(geom: ET.Element) -> bool:
+    return geom.get("contype") == "0" and geom.get("conaffinity") == "0"
+
+
+def _is_urdf_collision_geom(geom: ET.Element) -> bool:
+    # MuJoCo's URDF importer emits visual geoms with explicit 0/0 contact
+    # masks. Collision geoms may be meshes or primitive cylinders/boxes/spheres,
+    # and their contact masks are active or omitted. We intentionally key off
+    # the imported per-geom attributes, not the <default> values added later.
+    return not _is_explicitly_non_colliding_geom(geom)
 
 
 def _sanitize_name(value: str) -> str:
@@ -617,13 +644,15 @@ def _collision_proxy_metadata(geom_name: str, mesh_name: str = "") -> dict[str, 
     }
 
 
-def activate_urdf_collision_meshes(root: ET.Element) -> None:
-    """Name URDF collision meshes as active collision candidates.
+def activate_urdf_collision_geoms(root: ET.Element) -> None:
+    """Name URDF collision geoms as active collision candidates.
 
-    The URDF contains both visual and collision mesh entries. We keep the visual
-    meshes non-colliding and make the imported collision meshes explicit and
-    named. Later, these candidates are either kept as mesh collisions or
-    replaced by generated primitive proxies.
+    The URDF contains both visual and collision entries. We keep the imported
+    visual geoms non-colliding and make every imported collision geom explicit
+    and named, including mesh collisions and primitive cylinder/box/sphere
+    collisions. Later, mesh candidates are either kept as mesh collisions or
+    replaced by generated primitive proxies; imported primitive collisions stay
+    as their original primitive type.
     """
 
     name_counts: dict[str, int] = {}
@@ -631,11 +660,9 @@ def activate_urdf_collision_meshes(root: ET.Element) -> None:
     for body in iter_bodies(root):
         body_name = body.get("name", "body")
         for geom in body.findall("geom"):
-            if not _is_mesh_geom(geom):
-                continue
-            if _is_urdf_collision_mesh_geom(geom):
-                mesh_name = geom.get("mesh", "mesh")
-                name_base = _collision_name_base(body_name, mesh_name)
+            if _is_urdf_collision_geom(geom):
+                geom_label = geom.get("mesh") or geom.get("type") or "geom"
+                name_base = _collision_name_base(body_name, geom_label)
                 name_idx = name_counts.get(name_base, 0)
                 name_counts[name_base] = name_idx + 1
                 geom.set("name", f"{name_base}_{name_idx}")
@@ -646,7 +673,7 @@ def activate_urdf_collision_meshes(root: ET.Element) -> None:
                 geom.set("group", "3")
                 geom.set(
                     "rgba",
-                    str(_collision_proxy_metadata(geom.get("name", ""), mesh_name)["rgba_string"]),
+                    str(_collision_proxy_metadata(geom.get("name", ""), geom_label)["rgba_string"]),
                 )
                 collision_count += 1
             else:
@@ -655,7 +682,7 @@ def activate_urdf_collision_meshes(root: ET.Element) -> None:
                 geom.set("density", "0")
                 geom.set("group", geom.get("group", "1"))
     if collision_count == 0:
-        raise RuntimeError("No active URDF collision mesh geoms found after URDF import")
+        raise RuntimeError("No active URDF collision geoms found after URDF import")
 
 
 def scale_urdf_collision_meshes(
@@ -679,6 +706,7 @@ def scale_urdf_collision_meshes(
 
     converted = 0
     skipped = 0
+    non_mesh_active = 0
     created_mesh_assets: set[str] = set()
     for geom in root.iter("geom"):
         geom_name = geom.get("name", "")
@@ -686,7 +714,7 @@ def scale_urdf_collision_meshes(
             continue
         mesh_name = geom.get("mesh")
         if not mesh_name:
-            skipped += 1
+            non_mesh_active += 1
             continue
         source_mesh = mesh_assets.get(mesh_name)
         vertices = mesh_vertices.get(mesh_name)
@@ -731,6 +759,7 @@ def scale_urdf_collision_meshes(
         "collision_mesh_scale": float(collision_mesh_scale),
         "converted_collision_mesh_geoms": converted,
         "skipped_collision_mesh_geoms": skipped,
+        "non_mesh_active_collision_geoms": non_mesh_active,
         "created_scaled_mesh_assets": len(created_mesh_assets),
     }
 
@@ -775,6 +804,135 @@ def _capsule_axis_from_vertices(vertices: np.ndarray) -> np.ndarray:
     axis = np.zeros(3, dtype=np.float64)
     axis[int(np.argmax(extents))] = 1.0
     return axis
+
+
+def _arm_link_index_from_geom_name(geom_name: str) -> int | None:
+    match = re.search(r"collision_arm_(left|right)_link([0-9]+)", geom_name)
+    if not match:
+        return None
+    return int(match.group(2))
+
+
+def _find_body_containing_geom(root: ET.Element, target_geom: ET.Element) -> ET.Element | None:
+    target_name = target_geom.get("name")
+    for body in iter_bodies(root):
+        for geom in body.findall("geom"):
+            if geom is target_geom:
+                return body
+            if target_name and geom.get("name") == target_name:
+                return body
+    return None
+
+
+def _parse_body_pos(body: ET.Element | None) -> np.ndarray:
+    if body is None:
+        return np.zeros(3, dtype=np.float64)
+    return parse_vec_attr(body, "pos", 3, np.zeros(3, dtype=np.float64))
+
+
+def _same_side_arm_child_vector(body: ET.Element | None) -> tuple[ET.Element | None, np.ndarray | None]:
+    if body is None:
+        return None, None
+    body_name = body.get("name", "")
+    match = re.fullmatch(r"Link([0-9]+)_([RL])", body_name)
+    if not match:
+        return None, None
+    suffix = f"_{match.group(2)}"
+    for child in body.findall("body"):
+        child_name = child.get("name", "")
+        if not re.fullmatch(r"Link[0-9]+_[RL]", child_name):
+            continue
+        if not child_name.endswith(suffix):
+            continue
+        vector = _parse_body_pos(child)
+        if np.linalg.norm(vector) >= ARM_CAPSULE_CHILD_VECTOR_MIN_LENGTH_M:
+            return child, vector
+    return None, None
+
+
+def _terminal_hand_vector(body: ET.Element | None) -> tuple[str | None, np.ndarray | None]:
+    if body is None:
+        return None, None
+    candidates: list[np.ndarray] = []
+    names: list[str] = []
+    for geom in body.findall("geom"):
+        mesh_name = geom.get("mesh", "")
+        geom_name = geom.get("name", "")
+        if "palm" not in mesh_name and "palm" not in geom_name:
+            continue
+        vector = parse_vec_attr(geom, "pos", 3, np.zeros(3, dtype=np.float64))
+        if np.linalg.norm(vector) >= ARM_CAPSULE_CHILD_VECTOR_MIN_LENGTH_M:
+            candidates.append(vector)
+            names.append(geom_name or mesh_name or "palm_geom")
+    for child in body.findall("body"):
+        child_name = child.get("name", "")
+        if "finger" not in child_name:
+            continue
+        vector = _parse_body_pos(child)
+        if np.linalg.norm(vector) >= ARM_CAPSULE_CHILD_VECTOR_MIN_LENGTH_M:
+            candidates.append(vector)
+            names.append(child_name)
+    if not candidates:
+        return None, None
+    return "+".join(names[:4]), np.mean(np.stack(candidates, axis=0), axis=0)
+
+
+def _mesh_capsule_frame_in_body(
+    geom: ET.Element,
+    vertices: np.ndarray,
+    *,
+    length_quantile: float = 0.86,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    axis_mesh = _capsule_axis_from_vertices(vertices)
+    line_center = vertices.mean(axis=0)
+    centered = vertices - line_center
+    projections = centered @ axis_mesh
+    low_q = 0.5 * (1.0 - float(length_quantile))
+    high_q = 1.0 - low_q
+    lower_proj = float(np.quantile(projections, low_q))
+    upper_proj = float(np.quantile(projections, high_q))
+    midpoint_proj = 0.5 * (lower_proj + upper_proj)
+    center_mesh = line_center + midpoint_proj * axis_mesh
+    original_pos = parse_vec_attr(geom, "pos", 3, np.zeros(3, dtype=np.float64))
+    original_quat = parse_vec_attr(
+        geom,
+        "quat",
+        4,
+        np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
+    )
+    original_rot = quat_wxyz_to_matrix(original_quat)
+    axis_body = original_rot @ axis_mesh
+    axis_norm = np.linalg.norm(axis_body)
+    if axis_norm <= 0:
+        axis_body = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    else:
+        axis_body = axis_body / axis_norm
+    center_body = original_pos + original_rot @ center_mesh
+    return center_body, axis_body, max(0.0, upper_proj - lower_proj)
+
+
+def _arm_capsule_length_scale(proxy_scale: float) -> float:
+    return float(
+        np.clip(
+            math.sqrt(max(float(proxy_scale), 1e-6)),
+            ARM_CAPSULE_SCALE_MIN,
+            ARM_CAPSULE_SCALE_MAX,
+        )
+    )
+
+
+def _set_geom_as_capsule(
+    geom: ET.Element,
+    endpoint_a_body: np.ndarray,
+    endpoint_b_body: np.ndarray,
+    radius: float,
+) -> None:
+    for attr in ("mesh", "pos", "quat", "euler", "axisangle", "xyaxes", "zaxis"):
+        geom.attrib.pop(attr, None)
+    geom.set("type", "capsule")
+    geom.set("fromto", fmt_vec(np.concatenate([endpoint_a_body, endpoint_b_body])))
+    geom.set("size", fmt_vec(np.array([radius], dtype=np.float64)))
+    _set_collision_geom_common_attrs(geom)
 
 
 def _set_collision_geom_common_attrs(geom: ET.Element) -> None:
@@ -927,7 +1085,95 @@ def _convert_collision_geom_to_capsule(
     }
 
 
+def _convert_arm_collision_geom_to_capsule(
+    root: ET.Element,
+    geom: ET.Element,
+    vertices: np.ndarray,
+    proxy_scale: float,
+) -> dict[str, object]:
+    """Use a chain-aware capsule for ASM arm links instead of a PCA box.
+
+    The arm collision meshes often include joint hubs, so their oriented boxes
+    overlap heavily. For arm links we prefer a trimmed capsule along the next
+    structural child link; if that vector is unavailable, we fall back to the
+    mesh principal axis while still keeping a capsule proxy.
+    """
+
+    geom_name = geom.get("name", "")
+    link_index = _arm_link_index_from_geom_name(geom_name) or 0
+    body = _find_body_containing_geom(root, geom)
+    body_name = body.get("name", "") if body is not None else ""
+    length_scale = _arm_capsule_length_scale(proxy_scale)
+    radius_scale = float(np.clip(float(proxy_scale), 0.50, ARM_CAPSULE_SCALE_MAX))
+    base_radius = ARM_CAPSULE_RADIUS_AT_SCALE_1_BY_LINK.get(link_index, 0.030)
+    radius = max(0.008, base_radius * radius_scale)
+
+    axis_source = "mesh_pca"
+    to_body_name: str | None = None
+    child_body, child_vector = _same_side_arm_child_vector(body)
+    if child_vector is not None:
+        source_vector = child_vector
+        axis_source = "child_link"
+        to_body_name = child_body.get("name", "") if child_body is not None else None
+    else:
+        terminal_name, terminal_vector = _terminal_hand_vector(body)
+        if terminal_vector is not None:
+            source_vector = terminal_vector
+            axis_source = "terminal_hand"
+            to_body_name = terminal_name
+        else:
+            source_vector = None
+
+    if source_vector is not None:
+        vector_norm = float(np.linalg.norm(source_vector))
+        axis = source_vector / max(vector_norm, 1e-9)
+        center = 0.5 * source_vector
+        half_length = max(
+            ARM_CAPSULE_MIN_HALF_LENGTH_M,
+            (0.5 * vector_norm - ARM_CAPSULE_TRIM_MARGIN_M) * length_scale,
+        )
+        endpoint_a_body = center - axis * half_length
+        endpoint_b_body = center + axis * half_length
+    else:
+        center, axis, mesh_length = _mesh_capsule_frame_in_body(geom, vertices)
+        fallback_length = max(
+            float(mesh_length),
+            ARM_CAPSULE_FALLBACK_LENGTH_BY_LINK.get(link_index, 0.10),
+        )
+        half_length = max(
+            ARM_CAPSULE_MIN_HALF_LENGTH_M,
+            (0.5 * fallback_length - ARM_CAPSULE_TRIM_MARGIN_M) * length_scale,
+        )
+        endpoint_a_body = center - axis * half_length
+        endpoint_b_body = center + axis * half_length
+
+    _set_geom_as_capsule(geom, endpoint_a_body, endpoint_b_body, radius)
+    center_body = 0.5 * (endpoint_a_body + endpoint_b_body)
+    axis_body = endpoint_b_body - endpoint_a_body
+    length = float(np.linalg.norm(axis_body))
+    if length > 0:
+        axis_body = axis_body / length
+    return {
+        "proxy_type": "capsule",
+        "axis": axis_body.tolist(),
+        "center": center_body.tolist(),
+        "radius": float(radius),
+        "length": length,
+        "fromto": np.concatenate([endpoint_a_body, endpoint_b_body]).tolist(),
+        "link_index": int(link_index),
+        "from_body": body_name,
+        "to_body": to_body_name,
+        "axis_source": axis_source,
+        "trim_margin_m": float(ARM_CAPSULE_TRIM_MARGIN_M),
+        "length_scale": float(length_scale),
+        "radius_scale": float(radius_scale),
+        "reason": f"arm_{axis_source}_capsule",
+        "degenerate": False,
+    }
+
+
 def _convert_new_collision_proxy(
+    root: ET.Element,
     geom: ET.Element,
     vertices: np.ndarray,
     proxy_scale: float,
@@ -975,18 +1221,7 @@ def _convert_new_collision_proxy(
         )
 
     if kind == "arm_capsule":
-        return _convert_collision_geom_to_capsule(
-            geom,
-            vertices,
-            proxy_scale=proxy_scale,
-            length_quantile=0.78,
-            radius_quantile=0.78,
-            radius_scale=1.03,
-            min_radius=0.006,
-            min_half_length=0.018,
-            max_radius=0.055,
-            fallback_aspect_ratio=1.35,
-        )
+        return _convert_arm_collision_geom_to_capsule(root, geom, vertices, proxy_scale)
 
     return _convert_collision_geom_to_capsule(
         geom,
@@ -1037,7 +1272,7 @@ def replace_collision_meshes_with_primitive_proxies(
             skipped += 1
             continue
 
-        record = _convert_new_collision_proxy(geom, vertices, proxy_scale, min_half_size)
+        record = _convert_new_collision_proxy(root, geom, vertices, proxy_scale, min_half_size)
         record["geom_name"] = geom_name
         record["source_mesh"] = mesh_name
         proxy_records.append(record)
@@ -1495,8 +1730,16 @@ def write_collision_proxy_color_manifest(
                 "center": record.get("center"),
                 "radius": record.get("radius"),
                 "length": record.get("length"),
+                "fromto": record.get("fromto"),
                 "half_extents": record.get("half_extents"),
                 "trim_percentile": record.get("trim_percentile"),
+                "trim_margin_m": record.get("trim_margin_m"),
+                "link_index": record.get("link_index"),
+                "from_body": record.get("from_body"),
+                "to_body": record.get("to_body"),
+                "axis_source": record.get("axis_source"),
+                "length_scale": record.get("length_scale"),
+                "radius_scale": record.get("radius_scale"),
                 "reason": record.get("reason"),
             }
         )
@@ -1506,7 +1749,7 @@ def write_collision_proxy_color_manifest(
         "collision_mesh_scale": float(collision_mesh_scale),
         "source_urdf": str(source_urdf),
         "num_entries": len(entries),
-        "proxy_algorithm": "NewCollision trimmed PCA capsule / oriented bbox",
+        "proxy_algorithm": "NewCollision chain-aware arm capsules / trimmed PCA hand capsules / oriented bbox",
         "entries": entries,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1532,7 +1775,7 @@ def main() -> None:
 
     add_default_and_assets(root)
     wrap_worldbody_in_root(root, args.root_yaw_deg)
-    activate_urdf_collision_meshes(root)
+    activate_urdf_collision_geoms(root)
     if args.collision_geometry_mode == "primitive":
         collision_proxy_stats = replace_collision_meshes_with_primitive_proxies(
             root,
@@ -1560,6 +1803,7 @@ def main() -> None:
             f"scale={collision_scale_stats['collision_mesh_scale']} "
             f"converted={collision_scale_stats['converted_collision_mesh_geoms']} "
             f"skipped={collision_scale_stats['skipped_collision_mesh_geoms']} "
+            f"non_mesh_active={collision_scale_stats['non_mesh_active_collision_geoms']} "
             f"created_assets={collision_scale_stats['created_scaled_mesh_assets']}"
         )
     else:

@@ -34,9 +34,11 @@ init_rot_actuator_gain: 0.14
 init_rot_actuator_bias: 0.14
 guidance_decay_ratio: 0.8
 
+# 1. 采样噪声：优化器会在当前控制序列附近采样候选动作。
 joint_noise_scale: 0.03
 pos_noise_scale: 0.005
 rot_noise_scale: 0.005
+# 2. qpos_rew 权重：当前手臂和手指都回退到 joint_rew_scale=0.01，物体位置=1.0，物体旋转=0.3。
 joint_rew_scale: 0.01
 arm_joint_rew_scale: -1.0
 hand_joint_rew_scale: -1.0
@@ -44,9 +46,13 @@ base_pos_rew_scale: 0.0
 base_rot_rew_scale: 0.0
 pos_rew_scale: 1.0
 rot_rew_scale: 0.3
+# 3. qvel_rew 权重：速度跟踪很弱，只作为间接平滑项。
 vel_rew_scale: 0.0001
+# 4. terminal_rew 权重：窗口最后一步复用总 reward 后再乘这个系数。
 terminal_rew_scale: 1.0
+# 5. contact/fingertip reward：milk 当前没有接触点，且这个 conservative 配置关闭指尖显式位置 reward。
 contact_rew_scale: 0.0
 fingertip_rew_scale: 0.0
+# 6. 终止阈值：物体位置或朝向误差超过阈值时，该候选 rollout 会提前终止。
 object_pos_threshold: 0.15
 object_rot_threshold: 0.5

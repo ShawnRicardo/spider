@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-DATA_ID="${1:-${DATA_ID:-0}}"
+DATA_ID=0
 if ! [[ "${DATA_ID}" =~ ^[0-9]+$ ]]; then
   echo "DATA_ID must be a non-negative integer, got: ${DATA_ID}" >&2
   exit 2
@@ -15,7 +15,7 @@ export PYOPENGL_PLATFORM=egl
 export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/tmp/spider_warp_cache}"
 mkdir -p "${WARP_CACHE_PATH}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
+export CUDA_VISIBLE_DEVICES=6
 
 bash examples/asm_ourdata/run_ik_ourdata_milk_asm_URDFCollision.sh "${DATA_ID}"
 

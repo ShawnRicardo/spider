@@ -264,7 +264,7 @@ def main() -> None:
     parser.add_argument("--data-id", default="0")
     parser.add_argument("--mode", choices=["kinematic", "ikrollout", "mjwp"], default="kinematic")
     parser.add_argument("--model-path", default=None)
-    parser.add_argument("--trajectory-path", default="example_datasets/processed/ourdata/asm/bimanual/milk/0/trajectory_kinematic.npz")
+    parser.add_argument("--trajectory-path", default="example_datasets/processed/ourdata/asm/bimanual/milk/0/trajectory_mjwp.npz")
     parser.add_argument("--qpos-key", default="qpos")
     parser.add_argument("--bg-frame-dir", default=str(DEFAULT_BG_FRAME_DIR))
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))

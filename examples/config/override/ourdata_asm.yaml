@@ -32,6 +32,7 @@ nconmax_per_env: 1024
 njmax_per_env: 2048
 improvement_threshold: 0.0
 
+# 1. 采样噪声：优化器会在当前控制序列附近采样候选动作。
 first_ctrl_noise_scale: 0.2
 last_ctrl_noise_scale: 0.35
 final_noise_scale: 0.02
@@ -42,6 +43,7 @@ rot_noise_scale: 0.005
 # Tracking weights.
 # Keep arm tracking dominant, but give the real milk object enough weight to
 # affect sampling. Fingertip tracking is a moderate helper, not a hard target.
+# 2. qpos_rew 权重：base 不跟踪，物体位置/朝向、手臂关节、手指关节都参与跟踪。
 base_pos_rew_scale: 0.0
 base_rot_rew_scale: 0.0
 pos_rew_scale: 1.0
@@ -49,9 +51,13 @@ rot_rew_scale: 0.25
 joint_rew_scale: 1.0
 arm_joint_rew_scale: 2.0
 hand_joint_rew_scale: 1.0
+# 3. fingertip_rew 权重：额外跟踪左右手 10 个指尖 site 的世界坐标，不包含 palm/wrist 显式位置 reward。
 fingertip_rew_scale: 0.25
+# 4. qvel_rew 权重：速度跟踪项，主要起间接平滑作用。
 vel_rew_scale: 0.02
+# 5. terminal_rew 权重：窗口最后一步复用总 reward 后再乘这个系数。
 terminal_rew_scale: 0.8
 
+# 6. 终止阈值：物体位置或朝向误差超过阈值时，该候选 rollout 会提前终止。
 object_pos_threshold: 0.25
 object_rot_threshold: 0.8

@@ -10,6 +10,7 @@ import numpy as np
 SUPPORT_TABLE_CLEARANCE = 0.002
 SUPPORT_TABLE_MARGIN = 0.10
 SUPPORT_TABLE_HALF_THICKNESS = 0.02
+SUPPORT_TABLE_COLLISION_MODE_NONE = "none"
 SUPPORT_TABLE_COLLISION_MODE_OBJECT_ONLY = "object_only"
 SUPPORT_TABLE_COLLISION_MODE_OBJECT_AND_HAND = "object_and_hand"
 SUPPORT_TABLE_COLLISION_MODE_OBJECT_AND_MANIPULATOR = "object_and_manipulator"
@@ -313,6 +314,8 @@ def get_support_table_collision_targets(
     hand_collision_names: list[str],
     collision_mode: str,
 ) -> list[str]:
+    if collision_mode == SUPPORT_TABLE_COLLISION_MODE_NONE:
+        return []
     if collision_mode == SUPPORT_TABLE_COLLISION_MODE_OBJECT_ONLY:
         return list(object_collision_names)
     if collision_mode == SUPPORT_TABLE_COLLISION_MODE_OBJECT_AND_HAND:

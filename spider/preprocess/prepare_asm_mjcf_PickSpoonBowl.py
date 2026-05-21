@@ -453,12 +453,16 @@ def _is_mesh_geom(geom: ET.Element) -> bool:
     return geom.get("type") == "mesh" or "mesh" in geom.attrib
 
 
-def _is_urdf_collision_mesh_geom(geom: ET.Element) -> bool:
-    if not _is_mesh_geom(geom):
-        return False
-    # MuJoCo's URDF importer emits visual meshes with explicit 0/0 contact
-    # masks and collision meshes with active or omitted contact masks.
-    return not (geom.get("contype") == "0" and geom.get("conaffinity") == "0")
+def _is_explicitly_non_colliding_geom(geom: ET.Element) -> bool:
+    return geom.get("contype") == "0" and geom.get("conaffinity") == "0"
+
+
+def _is_urdf_collision_geom(geom: ET.Element) -> bool:
+    # MuJoCo's URDF importer emits visual geoms with explicit 0/0 contact
+    # masks. Collision geoms may be meshes or primitive cylinders/boxes/spheres,
+    # and their contact masks are active or omitted. We intentionally key off
+    # the imported per-geom attributes, not the <default> values added later.
+    return not _is_explicitly_non_colliding_geom(geom)
 
 
 def _sanitize_name(value: str) -> str:
@@ -495,13 +499,15 @@ def _collision_name_base(body_name: str, mesh_name: str) -> str:
     return f"collision_body_{_sanitize_name(body_name)}_{_sanitize_name(mesh_name)}"
 
 
-def activate_urdf_collision_meshes(root: ET.Element) -> None:
-    """Name URDF collision meshes as active collision candidates.
+def activate_urdf_collision_geoms(root: ET.Element) -> None:
+    """Name URDF collision geoms as active collision candidates.
 
-    The URDF contains both visual and collision mesh entries. We keep the visual
-    meshes non-colliding and make the imported collision meshes explicit and
-    named. Later, these candidates are either kept as mesh collisions or
-    replaced by generated primitive proxies.
+    The URDF contains both visual and collision entries. We keep the imported
+    visual geoms non-colliding and make every imported collision geom explicit
+    and named, including mesh collisions and primitive cylinder/box/sphere
+    collisions. Later, mesh candidates are either kept as mesh collisions or
+    replaced by generated primitive proxies; imported primitive collisions stay
+    as their original primitive type.
     """
 
     name_counts: dict[str, int] = {}
@@ -509,11 +515,9 @@ def activate_urdf_collision_meshes(root: ET.Element) -> None:
     for body in iter_bodies(root):
         body_name = body.get("name", "body")
         for geom in body.findall("geom"):
-            if not _is_mesh_geom(geom):
-                continue
-            if _is_urdf_collision_mesh_geom(geom):
-                mesh_name = geom.get("mesh", "mesh")
-                name_base = _collision_name_base(body_name, mesh_name)
+            if _is_urdf_collision_geom(geom):
+                geom_label = geom.get("mesh") or geom.get("type") or "geom"
+                name_base = _collision_name_base(body_name, geom_label)
                 name_idx = name_counts.get(name_base, 0)
                 name_counts[name_base] = name_idx + 1
                 geom.set("name", f"{name_base}_{name_idx}")
@@ -530,7 +534,7 @@ def activate_urdf_collision_meshes(root: ET.Element) -> None:
                 geom.set("density", "0")
                 geom.set("group", geom.get("group", "1"))
     if collision_count == 0:
-        raise RuntimeError("No active URDF collision mesh geoms found after URDF import")
+        raise RuntimeError("No active URDF collision geoms found after URDF import")
 
 
 def scale_urdf_collision_meshes(
@@ -554,6 +558,7 @@ def scale_urdf_collision_meshes(
 
     converted = 0
     skipped = 0
+    non_mesh_active = 0
     created_mesh_assets: set[str] = set()
     for geom in root.iter("geom"):
         geom_name = geom.get("name", "")
@@ -561,7 +566,7 @@ def scale_urdf_collision_meshes(
             continue
         mesh_name = geom.get("mesh")
         if not mesh_name:
-            skipped += 1
+            non_mesh_active += 1
             continue
         source_mesh = mesh_assets.get(mesh_name)
         vertices = mesh_vertices.get(mesh_name)
@@ -606,6 +611,7 @@ def scale_urdf_collision_meshes(
         "collision_mesh_scale": float(collision_mesh_scale),
         "converted_collision_mesh_geoms": converted,
         "skipped_collision_mesh_geoms": skipped,
+        "non_mesh_active_collision_geoms": non_mesh_active,
         "created_scaled_mesh_assets": len(created_mesh_assets),
     }
 
@@ -1180,7 +1186,7 @@ def main() -> None:
 
     add_default_and_assets(root)
     wrap_worldbody_in_root(root, args.root_yaw_deg)
-    activate_urdf_collision_meshes(root)
+    activate_urdf_collision_geoms(root)
     if args.collision_geometry_mode == "primitive":
         collision_proxy_stats = replace_collision_meshes_with_primitive_proxies(
             root,
@@ -1207,6 +1213,7 @@ def main() -> None:
             f"scale={collision_scale_stats['collision_mesh_scale']} "
             f"converted={collision_scale_stats['converted_collision_mesh_geoms']} "
             f"skipped={collision_scale_stats['skipped_collision_mesh_geoms']} "
+            f"non_mesh_active={collision_scale_stats['non_mesh_active_collision_geoms']} "
             f"created_assets={collision_scale_stats['created_scaled_mesh_assets']}"
         )
     else:

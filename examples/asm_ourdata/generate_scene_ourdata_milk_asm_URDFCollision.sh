@@ -3,8 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-DATA_ID="${DATA_ID:-0}"
-ASM_COLLISION_MESH_SCALE="${ASM_COLLISION_MESH_SCALE:-0.7}"
+DATA_ID=0
+ASM_COLLISION_MESH_SCALE=1.0
 if ! [[ "${DATA_ID}" =~ ^[0-9]+$ ]]; then
   echo "DATA_ID must be a non-negative integer, got: ${DATA_ID}" >&2
   exit 2
@@ -24,7 +24,7 @@ export PYOPENGL_PLATFORM=egl
 env -u LD_LIBRARY_PATH python spider/preprocess/prepare_asm_mjcf.py \
   --dataset-dir example_datasets \
   --dataset-name ourdata \
-  --source-urdf spider/assets/robots/asm_description/urdf/asm.urdf \
+  --source-urdf spider/assets/robots/asm_description/urdf/asm_7.urdf \
   --robot-type asm \
   --arm-kp 300 \
   --hand-kp 180 \
@@ -51,9 +51,12 @@ env -u LD_LIBRARY_PATH python spider/preprocess/generate_xml.py \
   --object-bbox-collision \
   --object-bbox-collision-margin 0.001 \
   --support-table-from-bbox \
-  --support-table-collision-mode object_and_hand \
-  --support-table-height-mode first_frame_min \
+  --support-table-collision-mode object_and_manipulator \
+  --support-table-height-mode trajectory_min \
   --support-table-z-offset=-0.05 \
+  --no-robot-object-collision \
+  --no-object-object-collision \
+  --no-object-floor-collision \
   --no-show-viewer
 
 # env -u LD_LIBRARY_PATH python spider/preprocess/generate_xml.py \

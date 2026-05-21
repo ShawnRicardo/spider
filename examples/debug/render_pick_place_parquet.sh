@@ -15,5 +15,5 @@ python examples/debug/render_pick_place_parquet_asm_videos.py \
   --collision-mode urdf_mesh_scaled \
   --urdf-collision-mesh-scale 1.0 \
   --exclude-initial-penetrations false \
-  --asm-variant asm_4 \
+  --asm-variant asm_5 \
   "$@"

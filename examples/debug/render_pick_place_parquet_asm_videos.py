@@ -68,19 +68,25 @@ ASM_VARIANT_DEFAULT = "asm"
 ASM_VARIANT_ASM_2 = "asm_2"
 ASM_VARIANT_ASM_3 = "asm_3"
 ASM_VARIANT_ASM_4 = "asm_4"
+ASM_VARIANT_ASM_5 = "asm_5"
 ASM_VARIANTS = (
     ASM_VARIANT_DEFAULT,
     ASM_VARIANT_ASM_2,
     ASM_VARIANT_ASM_3,
     ASM_VARIANT_ASM_4,
+    ASM_VARIANT_ASM_5
 )
 ASM_VARIANT_URDFS = {
     ASM_VARIANT_DEFAULT: REPO_ROOT / "spider/assets/robots/asm_description/urdf/asm.urdf",
     ASM_VARIANT_ASM_2: REPO_ROOT / "spider/assets/robots/asm_description/urdf/asm_2.urdf",
     ASM_VARIANT_ASM_3: REPO_ROOT / "spider/assets/robots/asm_description/urdf/asm_3.urdf",
     ASM_VARIANT_ASM_4: REPO_ROOT / "spider/assets/robots/asm_description/urdf/asm_4.urdf",
+    ASM_VARIANT_ASM_5: REPO_ROOT / "spider/assets/robots/asm_description/urdf/asm_5.urdf",
 }
 D435_SITE_NAME = "d435_optical_frame"
+FRONT_CAMERA_NAME = "front"
+SIDE_Y_CAMERA_NAME = "side_y"
+D435_RENDER_CAMERA_NAME = "d435_optical_render"
 COLLISION_MODE_URDF_MESH = "urdf_mesh"
 COLLISION_MODE_NONE = "none"
 COLLISION_MODE_URDF_MESH_SCALED = "urdf_mesh_scaled"
@@ -1091,7 +1097,11 @@ def _make_render_scene_xml(
     if worldbody is None:
         raise ValueError(f"Model {source_model_path} has no worldbody")
     for child in list(worldbody):
-        if child.tag == "camera" and child.get("name") in {"front", "d435_optical_render"}:
+        if child.tag == "camera" and child.get("name") in {
+            FRONT_CAMERA_NAME,
+            SIDE_Y_CAMERA_NAME,
+            D435_RENDER_CAMERA_NAME,
+        }:
             worldbody.remove(child)
         if child.tag == "light" and child.get("name") == "verify_key_light":
             worldbody.remove(child)
@@ -1156,7 +1166,21 @@ def _make_render_scene_xml(
         ET.Element(
             "camera",
             {
-                "name": "d435_optical_render",
+                "name": SIDE_Y_CAMERA_NAME,
+                "pos": "0 3.15 1.45",
+                # +Y side view, looking toward the robot with the same downward
+                # pitch as the front camera.
+                "xyaxes": "-1 0 0 0 -0.234222 0.972183",
+                "fovy": f"{float(front_fovy):.6g}",
+            },
+        ),
+    )
+    worldbody.insert(
+        4,
+        ET.Element(
+            "camera",
+            {
+                "name": D435_RENDER_CAMERA_NAME,
                 "pos": _format_vec(camera_pos),
                 "xyaxes": f"{_format_vec(d435_xaxis)} {_format_vec(d435_yaxis)}",
                 "fovy": f"{float(d435_fovy):.6g}",
@@ -1317,29 +1341,40 @@ def _write_collision_proxy_debug_video(
     width: int,
     height: int,
     progress_interval: int,
-) -> Path:
+) -> dict[str, Path]:
     model.vis.global_.offwidth = int(width)
     model.vis.global_.offheight = int(height)
     data = mujoco.MjData(model)
     renderer = mujoco.Renderer(model, height=height, width=width)
-    video_path = output_dir / f"{collision_mode}_collision_front.mp4"
+    video_paths = {
+        "front": output_dir / f"{collision_mode}_collision_front.mp4",
+        "side_y": output_dir / f"{collision_mode}_collision_side_y.mp4",
+    }
     total_frames = len(qpos)
     start_time = time.perf_counter()
     _log(
-        f"Writing {collision_mode} collision debug video: {total_frames} frames, "
-        f"{width}x{height}, fps={fps}"
+        f"Writing {collision_mode} collision debug videos: {total_frames} frames, "
+        f"{width}x{height}, fps={fps}, views={list(video_paths)}"
     )
-    with imageio.get_writer(video_path, fps=fps) as writer:
+    with ExitStack() as stack:
+        front_writer = stack.enter_context(imageio.get_writer(video_paths["front"], fps=fps))
+        side_y_writer = stack.enter_context(imageio.get_writer(video_paths["side_y"], fps=fps))
         for frame_idx, frame_qpos in enumerate(qpos):
             data.qpos[:] = frame_qpos
             data.qvel[:] = 0.0
-            writer.append_data(
-                _render_collision_debug_frame(renderer, data, "front")
+            front_writer.append_data(
+                _render_collision_debug_frame(renderer, data, FRONT_CAMERA_NAME)
+            )
+            side_y_writer.append_data(
+                _render_collision_debug_frame(renderer, data, SIDE_Y_CAMERA_NAME)
             )
             if _should_log_frame(frame_idx, total_frames, progress_interval):
                 _log_progress(f"{collision_mode}_collision", frame_idx, total_frames, start_time)
-    _log(f"Finished {collision_mode} collision debug video: {video_path}")
-    return video_path
+    _log(
+        f"Finished {collision_mode} collision debug videos: "
+        f"{video_paths['front']}, {video_paths['side_y']}"
+    )
+    return video_paths
 
 
 def _write_link_capsule_manifest(
@@ -1677,7 +1712,7 @@ def _write_summary(
     render_dynamic_head: bool,
     dynamic_rollout_saved: bool,
     collision_stats: dict[str, object],
-    collision_debug_video: Path | None,
+    collision_debug_videos: dict[str, Path] | None,
     link_capsule_manifest: Path | None,
     link_collision_manifest: Path | None,
     initial_penetration_exclude_manifest: Path | None,
@@ -1734,7 +1769,16 @@ def _write_summary(
             str(output_dir / "dynamic_rollout.npz") if dynamic_rollout_saved else None
         ),
         "collision": collision_stats,
-        "collision_debug_video": str(collision_debug_video) if collision_debug_video else None,
+        "collision_debug_video": (
+            str(collision_debug_videos.get("front"))
+            if collision_debug_videos and collision_debug_videos.get("front")
+            else None
+        ),
+        "collision_debug_videos": (
+            {name: str(path) for name, path in collision_debug_videos.items()}
+            if collision_debug_videos
+            else {}
+        ),
         "link_capsule_manifest": (
             str(link_capsule_manifest) if link_capsule_manifest else None
         ),
@@ -2115,7 +2159,7 @@ def main() -> None:
         render_front=args.render_kinematic_front,
         render_head=args.render_kinematic_head,
     )
-    collision_debug_video = None
+    collision_debug_videos = None
     if (
         args.collision_mode
         in {
@@ -2125,7 +2169,7 @@ def main() -> None:
         }
         and args.render_collision_debug
     ):
-        collision_debug_video = _write_collision_proxy_debug_video(
+        collision_debug_videos = _write_collision_proxy_debug_video(
             model,
             qpos_kinematic,
             output_dir,
@@ -2187,7 +2231,7 @@ def main() -> None:
         render_dynamic_head=args.render_dynamic_head,
         dynamic_rollout_saved=render_any_dynamic,
         collision_stats=collision_stats,
-        collision_debug_video=collision_debug_video,
+        collision_debug_videos=collision_debug_videos,
         link_capsule_manifest=link_capsule_manifest,
         link_collision_manifest=link_collision_manifest,
         initial_penetration_exclude_manifest=initial_penetration_exclude_manifest,
@@ -2207,8 +2251,9 @@ def main() -> None:
         _log(f"  {output_dir / 'dynamic_front.mp4'}")
     if args.render_dynamic_head:
         _log(f"  {output_dir / 'dynamic_d435.mp4'}")
-    if collision_debug_video is not None:
-        _log(f"  {collision_debug_video}")
+    if collision_debug_videos is not None:
+        for path in collision_debug_videos.values():
+            _log(f"  {path}")
     if link_capsule_manifest is not None:
         _log(f"  {link_capsule_manifest}")
     if link_collision_manifest is not None:

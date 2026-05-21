@@ -212,6 +212,7 @@ def _weight_diff_qpos(config: Config) -> torch.Tensor:
         "right",
         "left",
     ]:
+        # 1. 机器人关节角 qpos 跟踪权重：ASM 双臂时会把每侧 7 个手臂关节和 20 个手指关节分开加权。
         w[: config.nu] = config.joint_rew_scale
         arm_joint_weight = (
             config.arm_joint_rew_scale
@@ -232,11 +233,13 @@ def _weight_diff_qpos(config: Config) -> torch.Tensor:
             w[0:7] = arm_joint_weight
             w[7 : config.nu] = hand_joint_weight
         if config.nq_obj == 12:
+            # 2. 物体位姿 qpos 跟踪权重：pos_rew_scale 管位置，rot_rew_scale 管朝向。
             w[-12:-9] = config.pos_rew_scale
             w[-9:-6] = config.rot_rew_scale
             w[-6:-3] = config.pos_rew_scale
             w[-3:] = config.rot_rew_scale
         elif config.nq_obj == 14:
+            # 2. 物体位姿 qpos 跟踪权重：freejoint 物体用 3 维位置 + quat_sub 后的 3 维旋转误差。
             w[-12:-9] = config.pos_rew_scale
             w[-9:-6] = config.rot_rew_scale
             w[-6:-3] = config.pos_rew_scale
@@ -375,6 +378,7 @@ def _mask_empty_object_weights(
     if config.embodiment_type != "bimanual" or config.nq_obj != 14:
         return qpos_weight
 
+    # 3. milk 只有一个真实物体：空的 left_object/right_object 占位会被识别成 identity pose 并屏蔽 reward 权重。
     qpos_weight = qpos_weight.clone()
     right_object_empty = _is_empty_free_object_pose(qpos_ref[-14:-7])
     left_object_empty = _is_empty_free_object_pose(qpos_ref[-7:])
@@ -531,20 +535,22 @@ def get_reward(
     qpos_sim = wp.to_torch(env.data_wp.qpos)
     qvel_sim = wp.to_torch(env.data_wp.qvel)
 
-    # weighted qpos tracking 关节角
+    # 1. qpos_rew：跟踪 IK 给出的 qpos，包括机器人手臂/手指关节角，以及有效物体的位置和朝向。
     qpos_diff = _diff_qpos(
         config, qpos_sim, qpos_ref.unsqueeze(0).repeat(qpos_sim.shape[0], 1)
     )
     qpos_weight = _mask_empty_object_weights(config, _weight_diff_qpos(config), qpos_ref)
     delta_qpos = qpos_diff * qpos_weight
     qpos_dist = torch.norm(delta_qpos, p=2, dim=1)
+
+    # 2. qvel_rew：跟踪速度 qvel；它不是显式平滑项，但会间接抑制过大的速度差和抖动。
     qvel_diff = qvel_sim - qvel_ref
     qvel_dist = torch.norm(qvel_diff, p=2, dim=1)
 
     qpos_rew = -qpos_dist * 1.0
     qvel_rew = -config.vel_rew_scale * qvel_dist * 1.0
 
-    # contact reward
+    # 3. contact_rew：接触点位置 reward；milk 当前没有接触点数据，通常 contact_guidance=false 且该项为 0。
     if config.contact_rew_scale > 0.0 and len(config.contact_site_ids) > 0:
         site_xpos_torch = wp.to_torch(env.data_wp.site_xpos)
         contact_pos = site_xpos_torch[:, config.contact_site_ids]
@@ -556,6 +562,7 @@ def get_reward(
 
     right_fingertip_dist = torch.zeros(qpos_sim.shape[0], device=config.device)
     left_fingertip_dist = torch.zeros(qpos_sim.shape[0], device=config.device)
+    # 4. fingertip_rew：直接跟踪左右手指尖 site 的世界坐标；这里不包含 palm/wrist 的显式位置 reward。
     if (
         config.fingertip_rew_scale > 0.0
         and fingertip_pos_ref is not None
@@ -579,6 +586,7 @@ def get_reward(
         fingertip_dist = torch.zeros(qpos_sim.shape[0], device=config.device)
         fingertip_rew = torch.zeros(qpos_sim.shape[0], device=config.device)
 
+    # 5. total reward：非终止步 reward 只由 qpos、qvel、contact、fingertip 四项相加。
     reward = qpos_rew + qvel_rew + contact_rew + fingertip_rew
 
     info = {
@@ -626,6 +634,7 @@ def get_terminal_reward(
     # delta_qpos = (qpos_sim - qpos_ref) * qpos_weight
     # cost_object = config.terminal_rew_scale * torch.sum(delta_qpos**2, dim=1)
 
+    # 6. terminal_rew：窗口最后一步复用同一套 reward，再乘 terminal_rew_scale；当前不是单独的物体-only reward。
     rew, info = get_reward(config, env, ref_slice)
     terminal_rew = config.terminal_rew_scale * rew
     return terminal_rew, info
