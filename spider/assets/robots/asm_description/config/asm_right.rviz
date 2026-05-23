@@ -1,0 +1,494 @@
+Panels:
+  - Class: rviz_common/Displays
+    Help Height: 78
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /Status1
+        - /RobotModel1
+        - /TF1
+        - /TF1/Frames1
+        - /TF1/Tree1
+        - /Axes1
+      Splitter Ratio: 0.5
+    Tree Height: 787
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 1
+      Cell Size: 1
+      Class: rviz_default_plugins/Grid
+      Color: 160; 160; 164
+      Enabled: true
+      Line Style:
+        Line Width: 0.029999999329447746
+        Value: Lines
+      Name: Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 10
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Alpha: 1
+      Class: rviz_default_plugins/RobotModel
+      Collision Enabled: false
+      Description File: ""
+      Description Source: Topic
+      Description Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /robot_description
+      Enabled: true
+      Links:
+        All Links Enabled: true
+        Base_L:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        Base_R:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        Expand Joint Details: false
+        Expand Link Details: false
+        Expand Tree: false
+        Link Tree Style: Links in Alphabetic Order
+        Link1_L:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        Link1_R:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        Link2_L:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        Link2_R:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        Link3_L:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        Link3_R:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        Link4_L:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        Link4_R:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        Link5_L:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        Link5_R:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        Link6_L:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        Link6_R:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        Link7_L:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        Link7_R:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        base_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger1_link1:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger1_link2:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger1_link3:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger1_link4:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger1_tip_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger2_link1:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger2_link2:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger2_link3:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger2_link4:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger2_tip_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger3_link1:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger3_link2:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger3_link3:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger3_link4:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger3_tip_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger4_link1:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger4_link2:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger4_link3:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger4_link4:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger4_tip_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger5_link1:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger5_link2:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger5_link3:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger5_link4:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_finger5_tip_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        left_palm_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        link_left_wrist:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        link_right_wrist:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        neck_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger1_link1:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger1_link2:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger1_link3:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger1_link4:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger1_tip_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger2_link1:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger2_link2:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger2_link3:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger2_link4:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger2_tip_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger3_link1:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger3_link2:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger3_link3:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger3_link4:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger3_tip_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger4_link1:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger4_link2:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger4_link3:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger4_link4:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger4_tip_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger5_link1:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger5_link2:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger5_link3:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger5_link4:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_finger5_tip_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        right_palm_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+      Mass Properties:
+        Inertia: false
+        Mass: false
+      Name: RobotModel
+      TF Prefix: ""
+      Update Interval: 0
+      Value: true
+      Visual Enabled: true
+    - Class: rviz_default_plugins/TF
+      Enabled: false
+      Frame Timeout: 15
+      Frames:
+        All Enabled: false
+      Marker Scale: 1
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Tree:
+        {}
+      Update Interval: 0
+      Value: false
+    - Class: rviz_default_plugins/Axes
+      Enabled: true
+      Length: 2
+      Name: Axes
+      Radius: 0.019999999552965164
+      Reference Frame: <Fixed Frame>
+      Value: true
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: base_link
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+      Hide Inactive Objects: true
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 3.1248257160186768
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.05999999865889549
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Focal Point:
+        X: -0.18043135106563568
+        Y: 0.00865508709102869
+        Z: 1.2338309288024902
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05000000074505806
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.009999999776482582
+      Pitch: 0.09479865431785583
+      Target Frame: <Fixed Frame>
+      Value: Orbit (rviz)
+      Yaw: 0.3663395643234253
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 1016
+  Hide Left Dock: false
+  Hide Right Dock: false
+  QMainWindow State: 000000ff00000000fd0000000100000000000001f30000039efc0200000001fb000000100044006900730070006c006100790073010000003d0000039e000000c900ffffff000005410000039e00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  Width: 1850
+  X: 70
+  Y: 27

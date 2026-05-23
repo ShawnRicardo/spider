@@ -642,14 +642,16 @@ def _resolve_workspace_inputs(workspace_path: Path, object_id: str) -> Workspace
     )
     object_ply_path = _first_existing(
         [
+            workspace_path / "sam3d" / object_id / "obj_mesh_final.glb",
             workspace_path / "sam3d" / object_id / "obj_mesh_final.obj",
             workspace_path / "sam3d" / object_id / "obj_mesh_final.ply",
             workspace_path / "sam3d" / object_id / "obj_3d_final.ply",
+            workspace_path / "sam3d" / "obj_mesh_final.glb",
             workspace_path / "sam3d" / "obj_mesh_final.obj",
             workspace_path / "sam3d" / "obj_mesh_final.ply",
             workspace_path / "sam3d" / "obj_3d_final.ply",
         ],
-        "obj_mesh_final.obj, obj_mesh_final.ply, or obj_3d_final.ply",
+        "obj_mesh_final.glb, obj_mesh_final.obj, obj_mesh_final.ply, or obj_3d_final.ply",
     )
     masks_candidates = [
         workspace_path / "masks" / "objects_full",

@@ -31,7 +31,7 @@ env -u LD_LIBRARY_PATH python spider/preprocess/prepare_asm_mjcf.py \
   --collision-mesh-scale "${ASM_COLLISION_MESH_SCALE}" \
   --variants bimanual right left
 
-bash examples/asm_ourdata/process_ourdata_milk_PickSpoonBowlParams.sh
+bash examples/asm_ourdata/process_ourdata_milk_textured.sh
 
 env -u LD_LIBRARY_PATH python spider/preprocess/generate_xml.py \
   --dataset-dir example_datasets \
@@ -46,6 +46,7 @@ env -u LD_LIBRARY_PATH python spider/preprocess/generate_xml.py \
   --support-table-collision-mode object_and_manipulator \
   --support-table-height-mode trajectory_min \
   --support-table-z-offset=-0.05 \
+  --no-robot-object-collision \
   --no-show-viewer
 
 # env -u LD_LIBRARY_PATH python spider/preprocess/generate_xml.py \

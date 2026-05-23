@@ -16,7 +16,6 @@ __pycache__/
 # Project data and generated outputs
 preprocessed/
 example_datasets/
-spider/assets/
 
 # Logs and temp files
 *.log
