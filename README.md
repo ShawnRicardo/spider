@@ -1,32 +1,25 @@
 # Preprocessed 数据交付与 IK 运行说明
-
-当前这套 ourdata/ASM 流程的目标是：把你生成的一个场景目录放到 `preprocessed/<scene_name>/` 下，然后通过 `examples/asm_ourdata_watermelon` 中的脚本只运行 IK 阶段，得到 ASM 机器人的 kinematic 轨迹和调试视频。
-
-## 1. 数据应该放在哪里
-
-每个新场景单独放在：
+把每个新场景放到项目根目录下的：
 
 ```text
 preprocessed/<scene_name>/
 ```
 
-例如当前 watermelon 脚本默认读取：
+例如：
 
 ```text
 preprocessed/watermelon_server/
-```
-
-如果你生成的是一个新场景，比如 `robot`，建议放成：
-
-```text
 preprocessed/robot/
 ```
 
-后续只需要把脚本里的 `preprocessed/watermelon_server` 改成 `preprocessed/robot`。
+当前 ourdata/ASM 流程分两类入口：
 
-## 2. 必需目录结构
+- 单物体：一个真实交互物体，使用 `examples/asm_ourdata_watermelon/`。
+- 双物体：两只手分别交互两个物体，使用 `examples/asm_ourdata_2objs/`。
 
-IK 流程目前按“单个被操作物体”设计，默认物体目录名是 `obj_0`。最小可运行结构如下：
+## 单物体场景
+
+单物体流程默认只处理一个物体槽位，通常是 `obj_0`。最小目录结构如下：
 
 ```text
 preprocessed/<scene_name>/
@@ -36,6 +29,8 @@ preprocessed/<scene_name>/
 ├── sam3d/
 │   └── obj_0/
 │       ├── obj_mesh_final.glb          # 推荐
+│       ├── obj_mesh_final.obj          # 可选
+│       ├── obj_mesh_final.ply          # 可选
 │       └── obj_3d_final.ply            # 可选，用于点云/颜色调试
 └── result/
     └── obj_0/
@@ -47,138 +42,23 @@ preprocessed/<scene_name>/
                 └── ...
 ```
 
-也可以把物体 pose 放在：
+物体 pose 也可以放在：
 
 ```text
 preprocessed/<scene_name>/result/obj_0/poses/*.txt
 ```
 
-但如果两个目录都存在，当前处理代码优先读取：
+如果 `foundationpose_debug/center_pose/*.txt` 和 `poses/*.txt` 都存在，当前处理代码优先读取 `foundationpose_debug/center_pose/*.txt`。
 
-```text
-result/obj_0/foundationpose_debug/center_pose/*.txt
-```
+关键文件要求：
 
-## 3. 每个文件里需要有什么
+- `da3.npz`：至少包含 `cam_c2w (N,4,4)`、`intrinsic (3,3)` 或 `intrinsics (N,3,3)`；建议保留 `cam_w2c`、`depths`、`images`。
+- `hawor/world_mocap.npz`：至少包含 `right_verts`、`left_verts`、`right_joints`、`left_joints`、`right_faces`、`left_faces`。左右手数据不要有大段 `NaN`。
+- `result/obj_0/box_for_spider.npz`：必须包含 `box_center_world`、`box_rotation_R`、`box_pose_4x4`、`box_real_size_xyz_m`、`scale_factor`、`sam3d_model_size`。
+- `result/obj_0/.../*.txt`：每帧一个 `4x4` 的 `T_cam_obj`，处理脚本会计算 `T_world_obj = da3.cam_c2w[t] @ T_cam_obj[t]`。
+- `sam3d/obj_0/obj_mesh_final.glb`：推荐提供；也支持 `obj_mesh_final.obj`、`obj_mesh_final.ply`、`obj_3d_final.ply`。
 
-### `da3.npz`
-
-这是相机和 DA3 world 坐标系的核心文件，至少需要包含：
-
-```text
-cam_c2w      (N, 4, 4) float
-cam_w2c      (N, 4, 4) float
-intrinsic    (3, 3) 或 intrinsics (N, 3, 3)
-depths       (N, H, W) float，建议保留
-images       (N, H, W, 3) uint8，建议保留
-```
-
-`cam_c2w[t]` 表示第 `t` 帧相机坐标系到 DA3 world 坐标系的变换。
-
-### `hawor/world_mocap.npz`
-
-这是左右手的 3D 重建结果，至少需要包含：
-
-```text
-right_verts   (N, 778, 3) float32
-left_verts    (N, 778, 3) float32
-right_joints  (N, 21, 3) float32
-left_joints   (N, 21, 3) float32
-right_faces   (1552, 3)
-left_faces    (1552, 3)
-pred_space    "world"
-```
-
-要求：
-
-- 帧数 `N` 要和 `da3.npz`、物体 pose 文件数量一致。
-- 左右手数据必须尽量连续。
-- 不要有大段 `NaN`。IK 不能处理大段手部缺失。
-- 坐标系必须是 DA3 world，也就是和 `da3.npz` 的 `cam_c2w` 对齐。
-
-### `result/obj_0/box_for_spider.npz`
-
-这是物体真实尺寸和初始 bbox 信息，必须包含：
-
-```text
-box_center_world      (3,)
-box_rotation_R        (3, 3)
-box_pose_4x4          (4, 4)
-box_real_size_xyz_m   (3,)
-scale_factor          scalar
-sam3d_model_size      (3,)
-```
-
-其中最重要的是：
-
-```text
-box_real_size_xyz_m
-```
-
-它必须是真实物体尺寸，单位是米。MuJoCo 里的 bbox、桌子高度、物体大小都会依赖它。
-
-### `result/obj_0/foundationpose_debug/center_pose/*.txt`
-
-每一帧一个 `4x4` 矩阵文本文件：
-
-```text
-00000.txt
-00001.txt
-...
-```
-
-每个 txt 的含义应该是：
-
-```text
-T_cam_obj
-```
-
-也就是“物体在当前相机坐标系下的位置和朝向”。
-
-处理脚本会做：
-
-```text
-T_world_obj = da3.cam_c2w[t] @ T_cam_obj[t]
-```
-
-然后再通过 `d435_optical` 对齐到 ASM/MuJoCo 仿真坐标系。
-
-### `sam3d/obj_0/obj_mesh_final.glb`
-
-推荐提供 `glb`。也支持：
-
-```text
-obj_mesh_final.obj
-obj_mesh_final.ply
-obj_3d_final.ply
-```
-
-注意：mesh 的原始单位和大小可以不完全可靠，但 `box_for_spider.npz` 里的 `box_real_size_xyz_m` 必须正确。脚本会以 bbox 真实尺寸为准。
-
-## 4. 坐标系要求
-
-请保证以下三类数据在同一个 DA3 world 下自洽：
-
-```text
-world_mocap.npz 里的手
-da3.npz 里的 cam_c2w/cam_w2c
-center_pose/*.txt 通过 cam_c2w 转出来的物体 pose
-```
-
-一个快速检查方式是：把手和物体放到 Viser 里看。
-
-```bash
-conda run -n spider python visualize_watermelon_server_da3_viser.py \
-  --workspace preprocessed/<scene_name> \
-  --object-id obj_0 \
-  --port 8080
-```
-
-如果手和物体在 DA3 world 里明显离得很远，IK/MJWP 后面大概率也不会正常。
-
-## 5. 如何修改 `examples/asm_ourdata_watermelon` 脚本
-
-只跑 IK 时，入口是：
+只运行 IK 时，入口是：
 
 ```text
 examples/asm_ourdata_watermelon/run_ik_ourdata_watermelon_asm_URDFCollision.sh
@@ -192,15 +72,7 @@ run_ik_ourdata_watermelon_asm_URDFCollision.sh
     └── process_ourdata_watermelon_PickSpoonBowlParams.sh
 ```
 
-不需要运行：
-
-```text
-examples/asm_ourdata_watermelon/run_mjwp_ourdata_watermelon_asm_URDFCollision.sh
-```
-
-### 5.1 修改 `process_ourdata_watermelon_PickSpoonBowlParams.sh`
-
-找到 Python 调用里的这些参数：
+如果新场景叫 `robot`，需要在 `examples/asm_ourdata_watermelon/process_ourdata_watermelon_PickSpoonBowlParams.sh` 中把：
 
 ```bash
 --workspace preprocessed/watermelon_server
@@ -209,7 +81,7 @@ examples/asm_ourdata_watermelon/run_mjwp_ourdata_watermelon_asm_URDFCollision.sh
 --object-id obj_0
 ```
 
-如果你的数据目录是 `preprocessed/robot`，目标物体仍是 `obj_0`，可以改成：
+改成：
 
 ```bash
 --workspace preprocessed/robot
@@ -218,59 +90,9 @@ examples/asm_ourdata_watermelon/run_mjwp_ourdata_watermelon_asm_URDFCollision.sh
 --object-id obj_0
 ```
 
-如果目标物体是 `obj_1`，则改成：
+同时在 `generate_scene_ourdata_watermelon_asm_URDFCollision.sh` 和 `run_ik_ourdata_watermelon_asm_URDFCollision.sh` 中把 `--task watermelon_server` 改成同一个 task，例如 `--task robot`。
 
-```bash
---object-id obj_1
-```
-
-同时你的数据里也必须有：
-
-```text
-result/obj_1/box_for_spider.npz
-result/obj_1/foundationpose_debug/center_pose/*.txt
-sam3d/obj_1/obj_mesh_final.glb
-```
-
-### 5.2 修改 `generate_scene_ourdata_watermelon_asm_URDFCollision.sh`
-
-找到：
-
-```bash
---task watermelon_server
-```
-
-改成和上一步一致的 task，例如：
-
-```bash
---task robot
-```
-
-其他参数一般先不要改。
-
-### 5.3 修改 `run_ik_ourdata_watermelon_asm_URDFCollision.sh`
-
-找到：
-
-```bash
---task watermelon_server
-```
-
-改成同一个 task，例如：
-
-```bash
---task robot
-```
-
-如果需要换 GPU，修改或运行时覆盖：
-
-```bash
-CUDA_VISIBLE_DEVICES=0
-```
-
-## 6. 运行 IK
-
-进入项目根目录后运行：
+运行：
 
 ```bash
 conda activate spider
@@ -278,15 +100,7 @@ DATA_ID=0 CUDA_VISIBLE_DEVICES=0 \
 bash examples/asm_ourdata_watermelon/run_ik_ourdata_watermelon_asm_URDFCollision.sh
 ```
 
-如果不想改脚本里的 `CUDA_VISIBLE_DEVICES`，也可以直接：
-
-```bash
-bash examples/asm_ourdata_watermelon/run_ik_ourdata_watermelon_asm_URDFCollision.sh
-```
-
-## 7. IK 输出位置
-
-假设 `--task robot`、`DATA_ID=0`，主要输出在：
+假设 `task=robot`、`DATA_ID=0`，主要输出在：
 
 ```text
 example_datasets/processed/ourdata/asm/bimanual/robot/0/
@@ -298,9 +112,144 @@ example_datasets/processed/ourdata/asm/bimanual/robot/0/
 trajectory_kinematic.npz
 trajectory_ikrollout.npz
 visualization_ik.mp4
+visualization_ik_d435.mp4
 visualization_trajectory_kinematic.mp4
+visualization_trajectory_kinematic_d435.mp4
 ik_collision_diagnostics.json
 ik_collision_diagnostics.txt
+```
+
+## 双物体场景
+
+双物体流程用于“两只手分别抓两个物体”的场景。SPIDER 内部使用两个固定物体槽位：
+
+```text
+left_object
+right_object
+```
+
+当前默认映射是：
+
+```text
+left_object  <- obj_0
+right_object <- obj_1
+```
+
+如果需要交换槽位，可以在运行脚本时覆盖：
+
+```bash
+LEFT_OBJECT_ID=obj_1 RIGHT_OBJECT_ID=obj_0
+```
+
+最小目录结构如下：
+
+```text
+preprocessed/<scene_name>/
+├── da3.npz
+├── hawor/
+│   └── world_mocap.npz
+├── sam3d/
+│   ├── obj_0/
+│   │   └── obj_mesh_final.glb
+│   └── obj_1/
+│       └── obj_mesh_final.glb
+└── result/
+    ├── obj_0/
+    │   ├── box_for_spider.npz
+    │   └── foundationpose_debug/
+    │       └── center_pose/
+    │           ├── 00000.txt
+    │           └── ...
+    └── obj_1/
+        ├── box_for_spider.npz
+        └── foundationpose_debug/
+            └── center_pose/
+                ├── 00000.txt
+                └── ...
+```
+
+每个物体都必须有自己的：
+
+```text
+result/obj_x/box_for_spider.npz
+result/obj_x/foundationpose_debug/center_pose/*.txt
+sam3d/obj_x/obj_mesh_final.glb
+```
+
+`poses/*.txt` 也可以作为 pose 目录：
+
+```text
+result/obj_x/poses/*.txt
+```
+
+双物体数据转换会输出：
+
+```text
+qpos_obj_left   # 默认来自 obj_0
+qpos_obj_right  # 默认来自 obj_1
+```
+
+新的双物体脚本都在：
+
+```text
+examples/asm_ourdata_2objs/
+```
+
+只运行 IK：
+
+```bash
+conda activate spider
+WORKSPACE=preprocessed/robot \
+TASK=robot \
+LEFT_OBJECT_ID=obj_0 \
+RIGHT_OBJECT_ID=obj_1 \
+LEFT_OBJECT_NAME=left_obj \
+RIGHT_OBJECT_NAME=right_obj \
+DATA_ID=0 \
+CUDA_VISIBLE_DEVICES=0 \
+bash examples/asm_ourdata_2objs/run_ik_ourdata_2objs_asm_URDFCollision.sh
+```
+
+如果要继续运行 MJWP：
+
+```bash
+WORKSPACE=preprocessed/robot \
+TASK=robot \
+LEFT_OBJECT_ID=obj_0 \
+RIGHT_OBJECT_ID=obj_1 \
+LEFT_OBJECT_NAME=left_obj \
+RIGHT_OBJECT_NAME=right_obj \
+DATA_ID=0 \
+CUDA_VISIBLE_DEVICES=0 \
+bash examples/asm_ourdata_2objs/run_mjwp_ourdata_2objs_asm_URDFCollision.sh
+```
+
+双物体脚本会依次调用：
+
+```text
+run_ik_ourdata_2objs_asm_URDFCollision.sh
+└── generate_scene_ourdata_2objs_asm_URDFCollision.sh
+    └── process_ourdata_2objs.sh
+        └── spider/process_datasets/ourdata_textured_2objs.py
+```
+
+`trajectory_keypoints.npz` 必须同时包含：
+
+```text
+qpos_wrist_right
+qpos_finger_right
+qpos_obj_right
+qpos_wrist_left
+qpos_finger_left
+qpos_obj_left
+contact_right
+contact_left
+```
+
+假设 `TASK=robot`、`DATA_ID=0`，输出位置仍是：
+
+```text
+example_datasets/processed/ourdata/asm/bimanual/robot/0/
 ```
 
 中间转换结果在：
@@ -315,44 +264,36 @@ example_datasets/processed/ourdata/mano/bimanual/robot/0/
 example_datasets/processed/ourdata/asm/bimanual/robot/
 ```
 
-## 8. 常见失败原因
+### 坐标系和检查
 
-### 手部数据有大量 NaN
-
-如果 `world_mocap.npz` 里左右手大段为 `NaN`，IK 无法正常运行。需要重新生成或修复 HAWOR/world mocap。
-
-### 缺少 `box_for_spider.npz`
-
-没有真实 bbox 尺寸时，脚本不知道物体大小，也无法生成桌子高度和物体 bbox。
-
-### 缺少物体逐帧 pose
-
-必须提供：
+单物体和双物体都要求以下数据在同一个 DA3 world 下自洽：
 
 ```text
-result/obj_0/foundationpose_debug/center_pose/*.txt
+world_mocap.npz 里的左右手
+da3.npz 里的 cam_c2w/cam_w2c
+每个 obj_x 的 T_cam_obj 通过 cam_c2w 转出的物体 pose
 ```
 
-或者：
+推荐先用 Viser 检查手和物体是否在同一坐标系：
 
-```text
-result/obj_0/poses/*.txt
+```bash
+conda run -n spider python visualize_watermelon_server_da3_viser.py \
+  --workspace preprocessed/<scene_name> \
+  --object-id obj_0 \
+  --port 8080
 ```
 
-每一帧一个 `4x4` 矩阵。
+双物体场景需要分别检查 `obj_0` 和 `obj_1`。
 
-### 多物体场景
-
-当前 watermelon 脚本按单物体 `obj_0` 处理。如果场景里有多个物体，请先明确要操作哪个物体，并只把该物体作为 `--object-id` 输入。多物体同时进入 IK/MJWP 需要额外扩展代码。
-
-## 9. 提交数据前的最小检查清单
-
-请确认：
+### 提交数据前检查清单
 
 - `da3.npz` 存在，且 `cam_c2w` 是 `(N, 4, 4)`。
 - `hawor/world_mocap.npz` 存在，左右手帧数是 `N`。
 - `right_verts/left_verts/right_joints/left_joints` 不存在大段 `NaN`。
-- `result/obj_0/box_for_spider.npz` 存在。
-- `result/obj_0/foundationpose_debug/center_pose/*.txt` 数量至少是 `N`。
-- `sam3d/obj_0/obj_mesh_final.glb` 或等价 mesh 文件存在。
-- 用 Viser 看时，手和物体在 DA3 world 中位置关系合理。
+- 每个交互物体都有 `box_for_spider.npz`。
+- 每个交互物体都有逐帧 `4x4` pose txt，数量至少是 `N`。
+- 每个交互物体都有 `obj_mesh_final.glb` 或等价 mesh 文件。
+- `box_real_size_xyz_m` 是真实尺寸，单位是米。
+- 用 Viser 看时，左右手和所有物体的位置关系合理。
+
+第三个动态物体目前不支持。如果第三个物体只是静态背景道具，可以后续作为普通场景 mesh 处理；如果它也需要被抓取、跟踪、参与 reward，则需要把当前 `left_object/right_object` 双槽位重构成对象列表。
