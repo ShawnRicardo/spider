@@ -23,13 +23,7 @@ mkdir -p "${WARP_CACHE_PATH}"
 
 bash examples/asm_ourdata_2objs/run_ik_ourdata_2objs_asm_URDFCollision.sh "${DATA_ID}"
 
-if [[ -z "${MJWP_DEVICE:-}" ]]; then
-  if env -u LD_LIBRARY_PATH python -c "import torch; raise SystemExit(0 if torch.cuda.is_available() else 1)"; then
-    MJWP_DEVICE=cuda:0
-  else
-    MJWP_DEVICE=cpu
-  fi
-fi
+MJWP_DEVICE="${MJWP_DEVICE:-cuda:0}"
 echo "Using MJWP device: ${MJWP_DEVICE}"
 
 env -u LD_LIBRARY_PATH python examples/run_mjwp_2objs.py \

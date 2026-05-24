@@ -3,17 +3,18 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-DATA_ID="${DATA_ID:-0}"
-DATASET_NAME="${DATASET_NAME:-ourdata}"
-TASK="${TASK:-robot}"
-TRAJECTORY_INTERPOLATION_FACTOR="${TRAJECTORY_INTERPOLATION_FACTOR:-1}"
-ASM_SOURCE_URDF="${ASM_SOURCE_URDF:-spider/assets/robots/asm_description/urdf/asm_7.urdf}"
-ASM_COLLISION_MESH_SCALE="${ASM_COLLISION_MESH_SCALE:-1.0}"
-SUPPORT_TABLE_COLLISION_MODE="${SUPPORT_TABLE_COLLISION_MODE:-object_and_manipulator}"
-SUPPORT_TABLE_HEIGHT_MODE="${SUPPORT_TABLE_HEIGHT_MODE:-first_frame_min}"
-SUPPORT_TABLE_Z_OFFSET="${SUPPORT_TABLE_Z_OFFSET:-0}"
-OBJECT_BBOX_COLLISION_MARGIN="${OBJECT_BBOX_COLLISION_MARGIN:-0.001}"
-ROBOT_OBJECT_COLLISION="${ROBOT_OBJECT_COLLISION:-true}"
+DATA_ID=0
+DATASET_NAME=ourdata
+TASK=robot
+TRAJECTORY_INTERPOLATION_FACTOR=1
+SCENE_OFFSET_X=0.00
+SCENE_OFFSET_Y=0.00
+SCENE_OFFSET_Z=0.00
+ASM_COLLISION_MESH_SCALE=1.0
+SUPPORT_TABLE_COLLISION_MODE=object_and_manipulator
+SUPPORT_TABLE_HEIGHT_MODE=first_frame_min
+SUPPORT_TABLE_Z_OFFSET=0
+OBJECT_BBOX_COLLISION_MARGIN=0.001
 
 if ! [[ "${DATA_ID}" =~ ^[0-9]+$ ]]; then
   echo "DATA_ID must be a non-negative integer, got: ${DATA_ID}" >&2
@@ -55,25 +56,17 @@ env -u LD_LIBRARY_PATH python spider/preprocess/prepare_asm_mjcf.py \
 
 bash examples/asm_ourdata_2objs/process_ourdata_2objs.sh "${TRAJECTORY_INTERPOLATION_FACTOR}"
 
-generate_args=(
-  spider/preprocess/generate_xml.py
-  --dataset-dir example_datasets
-  --dataset-name "${DATASET_NAME}"
-  --robot-type asm
-  --embodiment-type bimanual
-  --task "${TASK}"
-  --data-id "${DATA_ID}"
-  --object-bbox-collision
-  --object-bbox-collision-margin "${OBJECT_BBOX_COLLISION_MARGIN}"
-  --support-table-from-bbox
-  --support-table-collision-mode "${SUPPORT_TABLE_COLLISION_MODE}"
-  --support-table-height-mode "${SUPPORT_TABLE_HEIGHT_MODE}"
-  "--support-table-z-offset=${SUPPORT_TABLE_Z_OFFSET}"
+env -u LD_LIBRARY_PATH python spider/preprocess/generate_xml.py \
+  --dataset-dir example_datasets \
+  --dataset-name "${DATASET_NAME}" \
+  --robot-type asm \
+  --embodiment-type bimanual \
+  --task "${TASK}" \
+  --data-id "${DATA_ID}" \
+  --object-bbox-collision \
+  --object-bbox-collision-margin "${OBJECT_BBOX_COLLISION_MARGIN}" \
+  --support-table-from-bbox \
+  --support-table-collision-mode "${SUPPORT_TABLE_COLLISION_MODE}" \
+  --support-table-height-mode "${SUPPORT_TABLE_HEIGHT_MODE}" \
+  --support-table-z-offset=0.0 \
   --no-show-viewer
-)
-
-if [[ "${ROBOT_OBJECT_COLLISION}" == "false" ]]; then
-  generate_args+=(--no-robot-object-collision)
-fi
-
-env -u LD_LIBRARY_PATH python "${generate_args[@]}"

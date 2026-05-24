@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-export CUDA_VISIBLE_DEVICES=6
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6}"
 
 DATA_ID="${1:-${DATA_ID:-0}}"
 if ! [[ "${DATA_ID}" =~ ^[0-9]+$ ]]; then
@@ -17,17 +17,9 @@ export PYOPENGL_PLATFORM=egl
 export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/tmp/spider_warp_cache}"
 mkdir -p "${WARP_CACHE_PATH}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6}"
-
 bash examples/asm_ourdata_watermelon/run_ik_ourdata_watermelon_asm_URDFCollision.sh "${DATA_ID}"
 
-if [[ -z "${MJWP_DEVICE:-}" ]]; then
-  if env -u LD_LIBRARY_PATH python -c "import torch; raise SystemExit(0 if torch.cuda.is_available() else 1)"; then
-    MJWP_DEVICE=cuda:0
-  else
-    MJWP_DEVICE=cpu
-  fi
-fi
+MJWP_DEVICE="${MJWP_DEVICE:-cuda:0}"
 echo "Using MJWP device: ${MJWP_DEVICE}"
 
 export MUJOCO_GL=egl

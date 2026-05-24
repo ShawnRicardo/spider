@@ -3,17 +3,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6}"
+export CUDA_VISIBLE_DEVICES=6
 
-DATA_ID="${1:-${DATA_ID:-0}}"
-DATASET_NAME="${DATASET_NAME:-ourdata}"
-TASK="${TASK:-robot}"
-TRAJECTORY_INTERPOLATION_FACTOR="${TRAJECTORY_INTERPOLATION_FACTOR:-1}"
-SCENE_OFFSET_X="${SCENE_OFFSET_X:-0.00}"
-SCENE_OFFSET_Y="${SCENE_OFFSET_Y:-0.00}"
-SCENE_OFFSET_Z="${SCENE_OFFSET_Z:-0.00}"
-ASM_COLLISION_MESH_SCALE="${ASM_COLLISION_MESH_SCALE:-1.0}"
-ENABLE_COLLISION="${ENABLE_COLLISION:-true}"
+DATA_ID=0
+DATASET_NAME=ourdata
+TASK=robot
+TRAJECTORY_INTERPOLATION_FACTOR=1
+SCENE_OFFSET_X=0.00
+SCENE_OFFSET_Y=0.00
+SCENE_OFFSET_Z=0.00
+ASM_COLLISION_MESH_SCALE=1.0
 
 if ! [[ "${DATA_ID}" =~ ^[0-9]+$ ]]; then
   echo "DATA_ID must be a non-negative integer, got: ${DATA_ID}" >&2
@@ -36,28 +35,21 @@ export SCENE_OFFSET_X
 export SCENE_OFFSET_Y
 export SCENE_OFFSET_Z
 export ASM_COLLISION_MESH_SCALE
-export MUJOCO_GL="${MUJOCO_GL:-egl}"
-export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
 
-echo "Running two-object IK: TASK=${TASK}, DATA_ID=${DATA_ID}, WORKSPACE=${WORKSPACE:-preprocessed/robot}, right=${RIGHT_OBJECT_ID:-obj_1}, left=${LEFT_OBJECT_ID:-obj_0}, collision=${ENABLE_COLLISION}"
+echo "Running two-object IK: TASK=${TASK}, DATA_ID=${DATA_ID}, WORKSPACE=${WORKSPACE:-preprocessed/robot}, right=${RIGHT_OBJECT_ID:-obj_1}, left=${LEFT_OBJECT_ID:-obj_0}"
 
 bash examples/asm_ourdata_2objs/generate_scene_ourdata_2objs_asm_URDFCollision.sh
 
-ik_args=(
-  spider/preprocess/ik.py
-  --dataset-dir example_datasets
-  --dataset-name "${DATASET_NAME}"
-  --robot-type asm
-  --embodiment-type bimanual
-  --task "${TASK}"
-  --data-id "${DATA_ID}"
-  --open-hand
-  --save-video
-  --no-show-viewer
-)
-
-if [[ "${ENABLE_COLLISION}" == "true" ]]; then
-  ik_args+=(--enable-collision)
-fi
-
-env -u LD_LIBRARY_PATH python "${ik_args[@]}"
+env -u LD_LIBRARY_PATH python spider/preprocess/ik.py \
+  --dataset-dir example_datasets \
+  --dataset-name "${DATASET_NAME}" \
+  --robot-type asm \
+  --embodiment-type bimanual \
+  --task "${TASK}" \
+  --data-id "${DATA_ID}" \
+  --open-hand \
+  --save-video \
+  --no-show-viewer \
+  --enable-collision
