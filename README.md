@@ -23,7 +23,9 @@ preprocessed/robot/
 
 ```text
 preprocessed/<scene_name>/
-├── da3.npz
+├── da3.npz                         # 推荐放这里
+├── da3/
+│   └── da3.npz                     # 如果根目录没有 da3.npz，则读取这里
 ├── hawor/
 │   └── world_mocap.npz
 ├── sam3d/
@@ -52,7 +54,7 @@ preprocessed/<scene_name>/result/obj_0/poses/*.txt
 
 关键文件要求：
 
-- `da3.npz`：至少包含 `cam_c2w (N,4,4)`、`intrinsic (3,3)` 或 `intrinsics (N,3,3)`；建议保留 `cam_w2c`、`depths`、`images`。
+- `da3.npz`：优先读取 `preprocessed/<scene_name>/da3.npz`；如果不存在，则读取 `preprocessed/<scene_name>/da3/da3.npz`。至少包含 `cam_c2w (N,4,4)`、`intrinsic (3,3)` 或 `intrinsics (N,3,3)`；建议保留 `cam_w2c`、`depths`、`images`。
 - `hawor/world_mocap.npz`：至少包含 `right_verts`、`left_verts`、`right_joints`、`left_joints`、`right_faces`、`left_faces`。左右手数据不要有大段 `NaN`。
 - `result/obj_0/box_for_spider.npz`：必须包含 `box_center_world`、`box_rotation_R`、`box_pose_4x4`、`box_real_size_xyz_m`、`scale_factor`、`sam3d_model_size`。
 - `result/obj_0/.../*.txt`：每帧一个 `4x4` 的 `T_cam_obj`，处理脚本会计算 `T_world_obj = da3.cam_c2w[t] @ T_cam_obj[t]`。
@@ -145,7 +147,9 @@ LEFT_OBJECT_ID=obj_1 RIGHT_OBJECT_ID=obj_0
 
 ```text
 preprocessed/<scene_name>/
-├── da3.npz
+├── da3.npz                         # 推荐放这里
+├── da3/
+│   └── da3.npz                     # 如果根目录没有 da3.npz，则读取这里
 ├── hawor/
 │   └── world_mocap.npz
 ├── sam3d/
@@ -287,7 +291,7 @@ conda run -n spider python visualize_watermelon_server_da3_viser.py \
 
 ### 提交数据前检查清单
 
-- `da3.npz` 存在，且 `cam_c2w` 是 `(N, 4, 4)`。
+- 根目录 `da3.npz` 或 `da3/da3.npz` 存在，且 `cam_c2w` 是 `(N, 4, 4)`。
 - `hawor/world_mocap.npz` 存在，左右手帧数是 `N`。
 - `right_verts/left_verts/right_joints/left_joints` 不存在大段 `NaN`。
 - 每个交互物体都有 `box_for_spider.npz`。

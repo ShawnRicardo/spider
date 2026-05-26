@@ -620,9 +620,9 @@ def _resolve_workspace_inputs(workspace_path: Path, object_id: str) -> Workspace
     camera_npz_path = _first_existing(
         [
             workspace_path / "da3.npz",
-            workspace_path / "mega_sam.npz",
+            workspace_path / "da3" / "da3.npz",
         ],
-        "camera/depth npz",
+        "da3.npz",
     )
     box_npz_path = _first_existing(
         [

@@ -47,4 +47,4 @@ env -u LD_LIBRARY_PATH python spider/preprocess/ik_watermelon.py \
   --open-hand \
   --save-video \
   --no-show-viewer \
-  --enable-collision
+  # --enable-collision

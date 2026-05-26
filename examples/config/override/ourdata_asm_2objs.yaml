@@ -4,7 +4,7 @@ dataset_dir: example_datasets
 dataset_name: ourdata
 robot_type: asm
 embodiment_type: bimanual
-task: robot
+task: pick_place
 data_id: 0
 
 viewer: none

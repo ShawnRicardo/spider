@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Viser viewer for milk/watermelon_server raw hand keypoints and object pose.
+"""Viser viewer for raw hand keypoints and object poses in a preprocessed scene.
 
 This script intentionally stays in the DA3/world coordinate frame. It does not
 apply the ASM d435_optical world-to-sim alignment used by IK/MJWP.
@@ -26,6 +26,12 @@ LEFT_VERT_COLOR = np.array([180, 210, 255], dtype=np.uint8)
 OBJECT_CENTER_COLOR = np.array([0, 220, 120], dtype=np.uint8)
 OBJECT_BBOX_COLOR = np.array([255, 220, 0], dtype=np.uint8)
 CAMERA_COLOR = np.array([255, 140, 0], dtype=np.uint8)
+OBJECT_PALETTE = [
+    np.array([255, 220, 0], dtype=np.uint8),
+    np.array([0, 220, 180], dtype=np.uint8),
+    np.array([220, 120, 255], dtype=np.uint8),
+    np.array([255, 120, 80], dtype=np.uint8),
+]
 
 BBOX_EDGES = [
     (0, 1),
@@ -68,9 +74,10 @@ MANO_HAND_EDGES = [
 
 @dataclass
 class ViewerConfig:
-    scene: str = "watermelon_server"
+    scene: str = "pick_place"
     workspace: str | None = None
     object_id: str = "obj_0"
+    object_ids: tuple[str, ...] | None = None
     pose_dir: str | None = None
     object_pose_mode: str = "camera_to_object"
     host: str = "0.0.0.0"
@@ -96,10 +103,17 @@ class SceneData:
     left_joints: np.ndarray
     right_vertices: np.ndarray | None
     left_vertices: np.ndarray | None
-    object_centers: np.ndarray
-    object_quats_wxyz: np.ndarray
-    object_extents: np.ndarray
-    object_mesh: trimesh.Trimesh | None
+    objects: list["ObjectData"]
+
+
+@dataclass
+class ObjectData:
+    object_id: str
+    pose_dir: Path
+    centers: np.ndarray
+    quats_wxyz: np.ndarray
+    extents: np.ndarray
+    mesh: trimesh.Trimesh | None
 
 
 def _parse_bool(value: str) -> bool:
@@ -114,14 +128,13 @@ def _parse_bool(value: str) -> bool:
 def parse_args() -> ViewerConfig:
     parser = argparse.ArgumentParser(
         description=(
-            "Visualize milk/watermelon_server raw hands and object in DA3 world "
+            "Visualize raw hands and one or more objects in DA3 world "
             "coordinates with Viser."
         )
     )
     parser.add_argument(
         "--scene",
         default=ViewerConfig.scene,
-        choices=["milk", "watermelon_server"],
         help="Predefined workspace under preprocessed/. Ignored only when --workspace is set.",
     )
     parser.add_argument(
@@ -129,7 +142,17 @@ def parse_args() -> ViewerConfig:
         default=None,
         help="Raw workspace directory. Defaults to preprocessed/<scene>.",
     )
-    parser.add_argument("--object-id", default=ViewerConfig.object_id)
+    parser.add_argument(
+        "--object-id",
+        default=ViewerConfig.object_id,
+        help="Single object id to visualize when --object-ids is not provided.",
+    )
+    parser.add_argument(
+        "--object-ids",
+        nargs="+",
+        default=None,
+        help="One or more object ids to visualize, e.g. --object-ids obj_0 obj_1.",
+    )
     parser.add_argument(
         "--pose-dir",
         default=None,
@@ -187,6 +210,7 @@ def parse_args() -> ViewerConfig:
         scene=args.scene,
         workspace=workspace,
         object_id=args.object_id,
+        object_ids=tuple(args.object_ids) if args.object_ids else None,
         pose_dir=args.pose_dir,
         object_pose_mode=args.object_pose_mode,
         host=args.host,
@@ -369,6 +393,26 @@ def _resolve_workspace(config: ViewerConfig) -> Path:
     return Path(workspace).resolve()
 
 
+def _resolve_da3_path(workspace: Path) -> Path:
+    candidates = [
+        workspace / "da3.npz",
+        workspace / "da3" / "da3.npz",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    raise FileNotFoundError(
+        "required da3.npz missing. Tried: "
+        + ", ".join(str(path) for path in candidates)
+    )
+
+
+def _resolve_object_ids(config: ViewerConfig) -> tuple[str, ...]:
+    if config.object_ids:
+        return config.object_ids
+    return (config.object_id,)
+
+
 def _resolve_pose_dir(workspace: Path, object_id: str, pose_dir_override: str | None) -> Path:
     if pose_dir_override is not None:
         pose_dir = Path(pose_dir_override)
@@ -426,46 +470,45 @@ def _print_distance_stats(data: SceneData) -> None:
         ],
         axis=1,
     )
-    dist = np.linalg.norm(tips - data.object_centers[:, None, :], axis=2)
-    closest = dist.min(axis=1)
-    closest_idx = dist.argmin(axis=1)
-    closest_z_delta = tips[np.arange(len(tips)), closest_idx, 2] - data.object_centers[:, 2]
-    loguru.logger.info(
-        "Closest fingertip-object distance: mean={:.4f} min={:.4f} max={:.4f} first={:.4f} mid={:.4f} last={:.4f}",
-        float(closest.mean()),
-        float(closest.min()),
-        float(closest.max()),
-        float(closest[0]),
-        float(closest[len(closest) // 2]),
-        float(closest[-1]),
-    )
-    loguru.logger.info(
-        "Closest fingertip z - object z: mean={:.4f} min={:.4f} max={:.4f} first={:.4f} mid={:.4f} last={:.4f}",
-        float(closest_z_delta.mean()),
-        float(closest_z_delta.min()),
-        float(closest_z_delta.max()),
-        float(closest_z_delta[0]),
-        float(closest_z_delta[len(closest_z_delta) // 2]),
-        float(closest_z_delta[-1]),
-    )
+    for obj in data.objects:
+        dist = np.linalg.norm(tips - obj.centers[:, None, :], axis=2)
+        closest = dist.min(axis=1)
+        closest_idx = dist.argmin(axis=1)
+        closest_z_delta = tips[np.arange(len(tips)), closest_idx, 2] - obj.centers[:, 2]
+        loguru.logger.info(
+            "{} closest fingertip-object distance: mean={:.4f} min={:.4f} max={:.4f} first={:.4f} mid={:.4f} last={:.4f}",
+            obj.object_id,
+            float(closest.mean()),
+            float(closest.min()),
+            float(closest.max()),
+            float(closest[0]),
+            float(closest[len(closest) // 2]),
+            float(closest[-1]),
+        )
+        loguru.logger.info(
+            "{} closest fingertip z - object z: mean={:.4f} min={:.4f} max={:.4f} first={:.4f} mid={:.4f} last={:.4f}",
+            obj.object_id,
+            float(closest_z_delta.mean()),
+            float(closest_z_delta.min()),
+            float(closest_z_delta.max()),
+            float(closest_z_delta[0]),
+            float(closest_z_delta[len(closest_z_delta) // 2]),
+            float(closest_z_delta[-1]),
+        )
 
 
 def load_scene(config: ViewerConfig) -> SceneData:
     workspace = _resolve_workspace(config)
-    da3_path = workspace / "da3.npz"
+    da3_path = _resolve_da3_path(workspace)
     mocap_path = workspace / "hawor" / "world_mocap.npz"
-    box_path = workspace / "result" / config.object_id / "box_for_spider.npz"
 
-    for path in [da3_path, mocap_path, box_path]:
+    for path in [da3_path, mocap_path]:
         if not path.exists():
             raise FileNotFoundError(f"required input missing: {path}")
-    pose_dir = _resolve_pose_dir(workspace, config.object_id, config.pose_dir)
+    object_ids = _resolve_object_ids(config)
 
     da3 = np.load(da3_path, allow_pickle=True)
     mocap = np.load(mocap_path, allow_pickle=True)
-    box = np.load(box_path, allow_pickle=True)
-    poses = _load_poses(pose_dir)
-    pose_count = len(poses)
 
     cam_c2w = da3["cam_c2w"].astype(np.float64)
     right_joints = mocap["right_joints"].astype(np.float32)
@@ -473,7 +516,24 @@ def load_scene(config: ViewerConfig) -> SceneData:
     right_vertices = mocap["right_verts"].astype(np.float32) if "right_verts" in mocap else None
     left_vertices = mocap["left_verts"].astype(np.float32) if "left_verts" in mocap else None
 
-    num_frames = min(len(cam_c2w), len(right_joints), len(left_joints), len(poses))
+    object_pose_items: list[tuple[str, Path, np.ndarray, np.lib.npyio.NpzFile]] = []
+    for object_id in object_ids:
+        box_path = workspace / "result" / object_id / "box_for_spider.npz"
+        if not box_path.exists():
+            raise FileNotFoundError(f"required input missing: {box_path}")
+        pose_dir = _resolve_pose_dir(
+            workspace,
+            object_id,
+            config.pose_dir if len(object_ids) == 1 else None,
+        )
+        box = np.load(box_path, allow_pickle=True)
+        poses = _load_poses(pose_dir)
+        object_pose_items.append((object_id, pose_dir, poses, box))
+
+    num_frames = min(
+        [len(cam_c2w), len(right_joints), len(left_joints)]
+        + [len(item[2]) for item in object_pose_items]
+    )
     if right_vertices is not None:
         num_frames = min(num_frames, len(right_vertices))
     if left_vertices is not None:
@@ -484,29 +544,41 @@ def load_scene(config: ViewerConfig) -> SceneData:
     cam_c2w = cam_c2w[:num_frames]
     right_joints = right_joints[:num_frames]
     left_joints = left_joints[:num_frames]
-    poses = poses[:num_frames]
     if right_vertices is not None:
         right_vertices = right_vertices[:num_frames, :: config.hand_vertex_stride, :]
     if left_vertices is not None:
         left_vertices = left_vertices[:num_frames, :: config.hand_vertex_stride, :]
 
-    object_poses = _object_world_poses(poses, cam_c2w, config.object_pose_mode)
-    object_centers = object_poses[:, :3, 3].astype(np.float32)
-    object_quats = np.stack(
-        [_rotmat_to_wxyz(pose[:3, :3]) for pose in object_poses],
-        axis=0,
-    )
-    object_extents = box["box_real_size_xyz_m"].astype(np.float32)
-    object_mesh = (
-        _load_object_mesh(
-            workspace,
-            config.object_id,
-            bbox_extents=object_extents,
-            fit_to_bbox=config.fit_object_mesh_to_bbox,
+    objects: list[ObjectData] = []
+    for object_id, pose_dir, poses, box in object_pose_items:
+        poses = poses[:num_frames]
+        object_poses = _object_world_poses(poses, cam_c2w, config.object_pose_mode)
+        object_centers = object_poses[:, :3, 3].astype(np.float32)
+        object_quats = np.stack(
+            [_rotmat_to_wxyz(pose[:3, :3]) for pose in object_poses],
+            axis=0,
         )
-        if config.show_object_mesh
-        else None
-    )
+        object_extents = box["box_real_size_xyz_m"].astype(np.float32)
+        object_mesh = (
+            _load_object_mesh(
+                workspace,
+                object_id,
+                bbox_extents=object_extents,
+                fit_to_bbox=config.fit_object_mesh_to_bbox,
+            )
+            if config.show_object_mesh
+            else None
+        )
+        objects.append(
+            ObjectData(
+                object_id=object_id,
+                pose_dir=pose_dir,
+                centers=object_centers,
+                quats_wxyz=object_quats.astype(np.float32),
+                extents=object_extents,
+                mesh=object_mesh,
+            )
+        )
 
     data = SceneData(
         num_frames=num_frames,
@@ -515,26 +587,26 @@ def load_scene(config: ViewerConfig) -> SceneData:
         left_joints=left_joints,
         right_vertices=right_vertices,
         left_vertices=left_vertices,
-        object_centers=object_centers,
-        object_quats_wxyz=object_quats.astype(np.float32),
-        object_extents=object_extents,
-        object_mesh=object_mesh,
+        objects=objects,
     )
 
     loguru.logger.info("scene={} workspace={}", config.scene, workspace)
-    loguru.logger.info("pose_dir={}", pose_dir)
+    loguru.logger.info("da3_path={}", da3_path)
+    for obj in objects:
+        loguru.logger.info("{} pose_dir={}", obj.object_id, obj.pose_dir)
     loguru.logger.info(
-        "frames: da3={} right_joints={} left_joints={} poses={} viewer={}",
+        "frames: da3={} right_joints={} left_joints={} object_pose_counts={} viewer={}",
         len(da3["cam_c2w"]),
         len(mocap["right_joints"]),
         len(mocap["left_joints"]),
-        pose_count,
+        {item[0]: len(item[2]) for item in object_pose_items},
         num_frames,
     )
     loguru.logger.info("object_pose_mode={}", config.object_pose_mode)
     _print_range("right_joints", data.right_joints)
     _print_range("left_joints", data.left_joints)
-    _print_range("object_centers", data.object_centers)
+    for obj in data.objects:
+        _print_range(f"{obj.object_id}_centers", obj.centers)
     _print_distance_stats(data)
     return data
 
@@ -556,7 +628,7 @@ def main(config: ViewerConfig) -> None:
         cell_color=(0.88, 0.88, 0.88),
     )
 
-    look_at = data.object_centers[0].astype(np.float64)
+    look_at = np.mean([obj.centers[0] for obj in data.objects], axis=0).astype(np.float64)
     camera_pos = look_at + np.array([0.7, -1.0, 0.45], dtype=np.float64)
 
     @server.on_client_connect
@@ -612,47 +684,62 @@ def main(config: ViewerConfig) -> None:
             visible=config.show_hand_vertices,
         )
 
-    corners = _obb_corners(
-        data.object_centers[0],
-        _wxyz_to_rotmat(data.object_quats_wxyz[0]),
-        data.object_extents,
-    )
-    object_center_handle = server.scene.add_point_cloud(
-        "/raw/object_center",
-        data.object_centers[0][None, :],
-        OBJECT_CENTER_COLOR,
-        point_size=config.point_size_object,
-        point_shape="rounded",
-    )
-    object_corners_handle = server.scene.add_point_cloud(
-        "/raw/object_bbox_corners",
-        corners,
-        OBJECT_BBOX_COLOR,
-        point_size=config.point_size_joints,
-        point_shape="diamond",
-    )
-    object_bbox_handle = server.scene.add_line_segments(
-        "/raw/object_bbox_edges",
-        _obb_segments(corners),
-        _line_colors(len(BBOX_EDGES), OBJECT_BBOX_COLOR),
-        line_width=2.0,
-    )
-    object_frame_handle = server.scene.add_frame(
-        "/raw/object_frame",
-        axes_length=config.object_axes_length,
-        axes_radius=0.004,
-        origin_radius=0.01,
-        position=data.object_centers[0],
-        wxyz=data.object_quats_wxyz[0],
-    )
-    object_mesh_handle = None
-    if data.object_mesh is not None:
-        object_mesh_handle = server.scene.add_mesh_trimesh(
-            "/raw/object_mesh",
-            data.object_mesh,
-            position=data.object_centers[0],
-            wxyz=data.object_quats_wxyz[0],
-            visible=config.show_object_mesh,
+    object_handles = []
+    for obj_idx, obj in enumerate(data.objects):
+        bbox_color = OBJECT_PALETTE[obj_idx % len(OBJECT_PALETTE)]
+        center_color = OBJECT_CENTER_COLOR if obj_idx == 0 else bbox_color
+        prefix = f"/raw/{obj.object_id}"
+        corners = _obb_corners(
+            obj.centers[0],
+            _wxyz_to_rotmat(obj.quats_wxyz[0]),
+            obj.extents,
+        )
+        center_handle = server.scene.add_point_cloud(
+            f"{prefix}/center",
+            obj.centers[0][None, :],
+            center_color,
+            point_size=config.point_size_object,
+            point_shape="rounded",
+        )
+        corners_handle = server.scene.add_point_cloud(
+            f"{prefix}/bbox_corners",
+            corners,
+            bbox_color,
+            point_size=config.point_size_joints,
+            point_shape="diamond",
+        )
+        bbox_handle = server.scene.add_line_segments(
+            f"{prefix}/bbox_edges",
+            _obb_segments(corners),
+            _line_colors(len(BBOX_EDGES), bbox_color),
+            line_width=2.0,
+        )
+        frame_handle = server.scene.add_frame(
+            f"{prefix}/frame",
+            axes_length=config.object_axes_length,
+            axes_radius=0.004,
+            origin_radius=0.01,
+            position=obj.centers[0],
+            wxyz=obj.quats_wxyz[0],
+        )
+        mesh_handle = None
+        if obj.mesh is not None:
+            mesh_handle = server.scene.add_mesh_trimesh(
+                f"{prefix}/mesh",
+                obj.mesh,
+                position=obj.centers[0],
+                wxyz=obj.quats_wxyz[0],
+                visible=config.show_object_mesh,
+            )
+        object_handles.append(
+            {
+                "object": obj,
+                "center": center_handle,
+                "corners": corners_handle,
+                "bbox": bbox_handle,
+                "frame": frame_handle,
+                "mesh": mesh_handle,
+            }
         )
 
     camera_frame_handle = server.scene.add_frame(
@@ -694,10 +781,11 @@ def main(config: ViewerConfig) -> None:
             disabled=right_vertices_handle is None and left_vertices_handle is None,
         )
         show_object = server.gui.add_checkbox("Object Center/BBox", initial_value=True)
+        has_object_mesh = any(item["mesh"] is not None for item in object_handles)
         show_mesh = server.gui.add_checkbox(
             "Object Mesh",
-            initial_value=config.show_object_mesh and object_mesh_handle is not None,
-            disabled=object_mesh_handle is None,
+            initial_value=config.show_object_mesh and has_object_mesh,
+            disabled=not has_object_mesh,
         )
         show_camera = server.gui.add_checkbox("DA3 Camera", initial_value=True)
 
@@ -733,12 +821,13 @@ def main(config: ViewerConfig) -> None:
             right_vertices_handle.visible = show_vertices.value
         if left_vertices_handle is not None:
             left_vertices_handle.visible = show_vertices.value
-        object_center_handle.visible = show_object.value
-        object_corners_handle.visible = show_object.value
-        object_bbox_handle.visible = show_object.value
-        object_frame_handle.visible = show_object.value
-        if object_mesh_handle is not None:
-            object_mesh_handle.visible = show_object.value and show_mesh.value
+        for item in object_handles:
+            item["center"].visible = show_object.value
+            item["corners"].visible = show_object.value
+            item["bbox"].visible = show_object.value
+            item["frame"].visible = show_object.value
+            if item["mesh"] is not None:
+                item["mesh"].visible = show_object.value and show_mesh.value
         camera_frame_handle.visible = show_camera.value
         camera_lines_handle.visible = show_camera.value
 
@@ -753,18 +842,20 @@ def main(config: ViewerConfig) -> None:
         if left_vertices_handle is not None and data.left_vertices is not None:
             left_vertices_handle.points = data.left_vertices[idx]
 
-        center = data.object_centers[idx]
-        quat = data.object_quats_wxyz[idx]
-        rot = _wxyz_to_rotmat(quat)
-        corners_frame = _obb_corners(center, rot, data.object_extents)
-        object_center_handle.points = center[None, :]
-        object_corners_handle.points = corners_frame
-        object_bbox_handle.points = _obb_segments(corners_frame)
-        object_frame_handle.position = tuple(center.tolist())
-        object_frame_handle.wxyz = tuple(quat.tolist())
-        if object_mesh_handle is not None:
-            object_mesh_handle.position = tuple(center.tolist())
-            object_mesh_handle.wxyz = tuple(quat.tolist())
+        for item in object_handles:
+            obj = item["object"]
+            center = obj.centers[idx]
+            quat = obj.quats_wxyz[idx]
+            rot = _wxyz_to_rotmat(quat)
+            corners_frame = _obb_corners(center, rot, obj.extents)
+            item["center"].points = center[None, :]
+            item["corners"].points = corners_frame
+            item["bbox"].points = _obb_segments(corners_frame)
+            item["frame"].position = tuple(center.tolist())
+            item["frame"].wxyz = tuple(quat.tolist())
+            if item["mesh"] is not None:
+                item["mesh"].position = tuple(center.tolist())
+                item["mesh"].wxyz = tuple(quat.tolist())
 
         camera_frame_handle.position = tuple(data.cam_c2w[idx, :3, 3].tolist())
         camera_frame_handle.wxyz = tuple(_rotmat_to_wxyz(data.cam_c2w[idx, :3, :3]).tolist())

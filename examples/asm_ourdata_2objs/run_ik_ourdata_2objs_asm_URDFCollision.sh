@@ -3,53 +3,32 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-export CUDA_VISIBLE_DEVICES=6
-
-DATA_ID=0
-DATASET_NAME=ourdata
-TASK=robot
-TRAJECTORY_INTERPOLATION_FACTOR=1
-SCENE_OFFSET_X=0.00
-SCENE_OFFSET_Y=0.00
-SCENE_OFFSET_Z=0.00
-ASM_COLLISION_MESH_SCALE=1.0
-
-if ! [[ "${DATA_ID}" =~ ^[0-9]+$ ]]; then
-  echo "DATA_ID must be a non-negative integer, got: ${DATA_ID}" >&2
-  exit 2
-fi
-if ! [[ "${TRAJECTORY_INTERPOLATION_FACTOR}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "TRAJECTORY_INTERPOLATION_FACTOR must be a positive integer, got: ${TRAJECTORY_INTERPOLATION_FACTOR}" >&2
-  exit 2
-fi
-if ! [[ "${ASM_COLLISION_MESH_SCALE}" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
-  echo "ASM_COLLISION_MESH_SCALE must be a positive number, got: ${ASM_COLLISION_MESH_SCALE}" >&2
-  exit 2
-fi
-
-export DATA_ID
-export DATASET_NAME
-export TASK
-export TRAJECTORY_INTERPOLATION_FACTOR
-export SCENE_OFFSET_X
-export SCENE_OFFSET_Y
-export SCENE_OFFSET_Z
-export ASM_COLLISION_MESH_SCALE
-export MUJOCO_GL=egl
-export PYOPENGL_PLATFORM=egl
-
-echo "Running two-object IK: TASK=${TASK}, DATA_ID=${DATA_ID}, WORKSPACE=${WORKSPACE:-preprocessed/robot}, right=${RIGHT_OBJECT_ID:-obj_1}, left=${LEFT_OBJECT_ID:-obj_0}"
+echo "Running two-object IK: task=pick_place data_id=0 left=apple:obj_0 right=banana:obj_1"
 
 bash examples/asm_ourdata_2objs/generate_scene_ourdata_2objs_asm_URDFCollision.sh
 
-env -u LD_LIBRARY_PATH python spider/preprocess/ik.py \
+# env -u LD_LIBRARY_PATH MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python examples/debug/render_ourdata_2objs_ref_keypoints_mujoco.py \
+#   --dataset-dir example_datasets \
+#   --dataset-name ourdata \
+#   --robot-type asm \
+#   --embodiment-type bimanual \
+#   --task pick_place \
+#   --data-id 0 \
+#   --output-path example_datasets/processed/ourdata/asm/bimanual/pick_place/0/visualization_ref_keypoints_mujoco.mp4
+
+env -u LD_LIBRARY_PATH CUDA_VISIBLE_DEVICES=6 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python spider/preprocess/ik_2objs.py \
   --dataset-dir example_datasets \
-  --dataset-name "${DATASET_NAME}" \
+  --dataset-name ourdata \
   --robot-type asm \
   --embodiment-type bimanual \
-  --task "${TASK}" \
-  --data-id "${DATA_ID}" \
+  --task pick_place \
+  --data-id 0 \
   --open-hand \
   --save-video \
+  --visualize-hand-keypoints \
+  --visualize-object-bbox \
+  --visualize-object-axes \
+  --visualize-robot-base-axes \
+  --visualize-head-camera-axes \
   --no-show-viewer \
   --enable-collision
